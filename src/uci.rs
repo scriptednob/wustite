@@ -112,7 +112,7 @@
 //!
 //! ```text
 //! > uci
-//! < id name Wustite 0.2.0
+//! < id name Wustite 0.3.0
 //! < id author Taheem
 //! < option name Hash type spin default 16 min 1 max 65536
 //! < ...
