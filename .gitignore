@@ -1,0 +1,4 @@
+/target
+Cargo.lock.bak
+*.nnue
+!nets/wustite.nnue

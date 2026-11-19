@@ -1,0 +1,35 @@
+[package]
+name = "wustite"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A competitive chess engine, built with Rust and Python."
+license = "GPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/scriptednob/wustite"
+keywords = ["chess", "uci", "chess-engine", "bitboard", "alpha-beta"]
+categories = ["games", "command-line-utilities"]
+exclude = [".github", "tools", "target"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = ["--generate-link-to-definition"]
+
+[lib]
+name = "wustite"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wustite"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
