@@ -2,7 +2,7 @@
 //!
 //! NNUE ("Efficiently Updatable Neural Network", from the Japanese shogi
 //! community, ported to chess by Stockfish) is a small neural network whose first
-//! layer is so sparse and so incrementally updatable that it can run inside a
+//! layer is sparse and cheap to update, which lets it run inside a
 //! search at millions of positions per second on a CPU. Wustite uses the
 //! simplest useful architecture and trains it entirely with the tools in this
 //! repository (`examples/datagen.rs` and `examples/train.rs`).

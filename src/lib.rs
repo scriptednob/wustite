@@ -4,9 +4,8 @@
 //! evaluation that is trained entirely with the tools in this repository.
 //!
 //! This crate is both the engine library and, through the `wustite` binary, the
-//! engine itself. The documentation here is meant to be read as a guide to how a
-//! modern alpha-beta engine is built: every module explains *what* it does and
-//! *why*, and the sections below show how the pieces fit together.
+//! engine itself. Each module explains *what* it does and *why*, and the sections
+//! below show how the pieces fit together.
 //!
 //! ## One move, end to end
 //!

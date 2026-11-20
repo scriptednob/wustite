@@ -13,7 +13,7 @@
 
 Wustite is an open source UCI chess engine written in Rust with no dependencies, using an NNUE evaluation that is trained entirely with the tools in this repository.
 
-It is built to be read as well as played against. Every module of the library explains what it does and why, with runnable examples, and the whole reference is on [docs.rs](https://docs.rs/wustite).
+Every module of the library explains what it does and why, with runnable examples. The whole reference is on [docs.rs](https://docs.rs/wustite).
 
 ## Strength
 
@@ -80,7 +80,7 @@ Without any flags the engine uses magic bitboards and picks AVX2 at runtime for 
 
 ### Usage
 
-Wustite is not a complete chess program. It needs a UCI interface such as [Cute Chess](https://github.com/cutechess/cutechess), [Arena](http://www.playwitharena.de/) or [En Croissant](https://github.com/franciscoBSalgueiro/en-croissant). It also works with [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot).
+Wustite has no board or GUI of its own. It needs a UCI front end such as [Cute Chess](https://github.com/cutechess/cutechess), [Arena](http://www.playwitharena.de/) or [En Croissant](https://github.com/franciscoBSalgueiro/en-croissant), and it also works with [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot).
 
 You can also talk to it directly from a terminal:
 

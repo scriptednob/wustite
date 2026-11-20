@@ -3,8 +3,7 @@
 //! A transposition table caches search results keyed by position hash, so a
 //! position reached by a different move order (a *transposition*) is not searched
 //! again, and so the best move found at a shallower depth can be tried first at
-//! the next iteration. It is the largest single contributor to search strength
-//! after alpha-beta itself.
+//! the next iteration.
 //!
 //! # Thread safety without locks
 //!

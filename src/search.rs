@@ -1,7 +1,7 @@
 //! The search: alpha-beta with principal variation search, iterative deepening and
 //! Lazy SMP.
 //!
-//! This is the engine's brain. Given a position and a set of limits, it looks
+//! Given a position and a set of limits, it looks
 //! ahead through the game tree and returns the best move it can find. The public
 //! entry points are [`think`] (full control, used by the UCI layer) and
 //! [`search_depth`] (a convenience for fixed-depth searches). The tunable switches
@@ -43,8 +43,7 @@
 //!
 //! # Iterative deepening and aspiration windows
 //!
-//! [`think`] searches depth 1, then 2, then 3 and so on. That sounds wasteful, but
-//! each iteration fills the transposition table and history tables that make the
+//! [`think`] searches depth 1, then 2, then 3 and so on. Each iteration fills the transposition table and history tables that make the
 //! next one faster, the best move is always available if time runs out, and the
 //! time manager gets a clean point to decide whether to start another iteration.
 //!
@@ -101,7 +100,7 @@
 //!
 //! # Move ordering
 //!
-//! Alpha-beta only shines if the best move is tried first. Moves are scored once
+//! Alpha-beta is fast only if the best move is tried first. Moves are scored once
 //! per node, and the highest-scoring unplayed move is picked each step (a
 //! selection sort, since most nodes are cut off after one or two moves).
 //!
@@ -125,7 +124,7 @@
 //!
 //! # Quiescence search
 //!
-//! At depth zero the search does not just evaluate: it runs a quiescence search,
+//! At depth zero the search runs a quiescence search,
 //! which keeps searching **captures and promotions only** until the position is
 //! "quiet". The static evaluation acts as a *stand pat* score: the side to move is
 //! assumed able to decline all captures, so the evaluation is a lower bound.

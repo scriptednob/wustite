@@ -2,8 +2,8 @@
 //!
 //! Nothing in this module is computed at run time and there is no
 //! initialisation function: all tables are `static` values produced by `const fn`
-//! evaluation, so they live in the binary's read-only data and the first call
-//! costs the same as the millionth.
+//! evaluation, so they live in the binary's read-only data, and the first call
+//! costs the same as any other.
 //!
 //! # Leapers
 //!

@@ -11,8 +11,7 @@
 //! returns a **new** position. There is no `unmake`. Instead the search keeps the
 //! parent position on the stack and simply drops the child when it returns.
 //!
-//! This is a deliberate choice for a multi-threaded engine with a cache-conscious
-//! layout. The struct is exactly 192 bytes (three 64-byte cache lines, enforced
+//! Copy-make suits a multi-threaded engine with a cache-conscious layout. The struct is exactly 192 bytes (three 64-byte cache lines, enforced
 //! by `repr(C, align(64))`) and `Copy`, so making a move is a handful of
 //! cache-line copies followed by a few XORs. In exchange the search never has to
 //! store undo information (captured piece, previous castling rights, previous en
