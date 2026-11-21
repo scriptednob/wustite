@@ -2,3 +2,6 @@
 Cargo.lock.bak
 *.nnue
 !nets/wustite.nnue
+/data/
+/test.txt
+/*.nnue
