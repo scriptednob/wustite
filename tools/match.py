@@ -153,9 +153,9 @@ def play_game(path_white, path_black, opts_white, opts_black, opening, args, gam
                 win_side = None
                 mine = [s for sd, s in last if sd == last[-1][0]]
                 theirs = [s for sd, s in last if sd != last[-1][0]]
-                if all(s >= 900 for s in mine) and all(s <= -900 for s in theirs):
+                if all(s >= 1500 for s in mine) and all(s <= -1500 for s in theirs):
                     win_side = last[-1][0]
-                elif all(s <= -900 for s in mine) and all(s >= 900 for s in theirs):
+                elif all(s <= -1500 for s in mine) and all(s >= 1500 for s in theirs):
                     win_side = 1 - last[-1][0]
                 if win_side is not None:
                     return ("white" if win_side == 0 else "black"), "adjudicated", depths
