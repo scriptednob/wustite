@@ -1,23 +1,14 @@
-//! Zobrist hashing keys for positions.
+//! Compile-time Zobrist hashing keys.
 //!
-//! A Zobrist hash identifies a position by XOR-ing together a random 64-bit key
-//! for each feature that is present: every (piece, square) pair, the castling
-//! rights, the en passant file, and a key that is included when black is to move.
-//! XOR is its own inverse, so the hash can be updated incrementally when a move
-//! is made by XOR-ing out the features that disappear and XOR-ing in the ones that
-//! appear, without looking at the rest of the board. [`crate::board::Position`]
-//! does exactly that in `make_move`, and [`crate::board::Position::compute_hash`]
-//! recomputes it from scratch as a cross-check.
+//! A position hash XORs together a 64-bit random key for every piece on its
+//! square, the castling rights mask, the active en passant file (if any), and a
+//! side-to-move key when black is to move. Since XOR cancels itself out,
+//! [`crate::board::Position::make_move`] updates the hash incrementally instead
+//! of rescanning the board, and [`crate::board::Position::compute_hash`] stays
+//! around to cross-check it in tests.
 //!
-//! The key table is generated at compile time with the SplitMix64 generator from
-//! a fixed seed. That has two practical consequences: the keys are identical in
-//! every build on every platform, so hashes are reproducible and the same
-//! position always has the same key in test output, and there is no run-time
-//! start-up cost.
-//!
-//! Collisions are possible in principle (two positions sharing a key) but with
-//! 64-bit keys they are astronomically rare at the table sizes engines use, and
-//! the transposition table additionally validates entries with its own check word.
+//! Keys are built at compile time with SplitMix64 from a fixed seed, so hashes
+//! are identical across builds and platforms with zero startup cost.
 //!
 //! ```
 //! use wustite::Position;
@@ -26,8 +17,7 @@
 //! assert_eq!(start.hash(), start.compute_hash());
 //! ```
 
-/// One step of the SplitMix64 generator. Takes the generator state and returns
-/// the next state together with a well-mixed 64-bit output.
+/// Advance SplitMix64 by one step, returning `(next_state, mixed_output)`.
 const fn splitmix64(state: u64) -> (u64, u64) {
     let next = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = next;
@@ -36,20 +26,20 @@ const fn splitmix64(state: u64) -> (u64, u64) {
     (next, z ^ (z >> 31))
 }
 
-/// The complete set of Zobrist keys. A single instance, [`ZOBRIST`], is built at compile time.
+/// Complete set of Zobrist keys, built at compile time in [`ZOBRIST`].
 pub struct Zobrist {
-    /// One key for each of the 12 [`crate::types::Piece`] values on each of the 64 squares, indexed `[piece][square]`.
+    /// Keys for each [`crate::types::Piece`] on each square, indexed `[piece][square]`.
     pub piece_square: [[u64; 64]; 12],
-    /// One key per castling-rights bitmask value `0..16` (see [`crate::board::ALL_CASTLING`]). The whole mask is hashed as a unit.
+    /// One key per 4-bit castling rights mask (`0..16`, see [`crate::board::ALL_CASTLING`]).
     pub castling: [u64; 16],
-    /// One key per file, XOR-ed in while an en passant capture is actually available on that file.
+    /// One key per file, mixed in only when an en passant capture is actually available.
     pub ep_file: [u64; 8],
-    /// XOR-ed in when black is to move, so the same arrangement with a different side to move hashes differently.
+    /// Mixed in whenever black is to move.
     pub side: u64,
 }
 
 impl Zobrist {
-    /// Fills every key from the fixed-seed SplitMix64 stream, in a fixed order, entirely at compile time.
+    /// Fill all keys at compile time from a fixed SplitMix64 seed.
     const fn build() -> Zobrist {
         let mut state = 0x5755_5354_4954_4521u64;
         let mut keys = Zobrist {
@@ -93,5 +83,5 @@ impl Zobrist {
     }
 }
 
-/// The global key table.
+/// Global compile-time Zobrist key table.
 pub static ZOBRIST: Zobrist = Zobrist::build();

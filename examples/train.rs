@@ -1,3 +1,19 @@
+//! Pure-Rust NNUE trainer for Wustite's `(768 -> 128) x 2 -> 1` SCReLU network.
+//!
+//! Reads `fen;score;wdl` files produced by `examples/datagen.rs`, trains float
+//! weights with Adam (exponential learning-rate decay) against MSE on sigmoid
+//! targets blended by `--lambda`, and writes both a quantized `.nnue` network
+//! and a raw float checkpoint (`<out>.params`) after every epoch.
+//!
+//! At the end of training, prints the mean and worst-case centipawn difference
+//! between the float model and the quantized `i16` network on a validation sample.
+//!
+//! Example:
+//! ```text
+//! RUSTFLAGS="-C target-cpu=native" cargo run --release --example train -- \
+//!     --data data.txt --out net.nnue --epochs 150 --threads 4
+//! ```
+
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -11,6 +27,7 @@ const WEIGHT_LIMIT: f32 = 1.98;
 const OUTPUT_WEIGHT_LIMIT: f32 = 127.0 / QB as f32;
 const LABEL_SCALE: f32 = 400.0;
 
+/// Minimal XorShift64* RNG for weight init, train/val split, and epoch shuffles.
 struct Rng(u64);
 
 impl Rng {
@@ -34,6 +51,7 @@ impl Rng {
     }
 }
 
+/// Pre-extracted active feature indices for both perspectives plus the blended target.
 #[derive(Clone, Copy)]
 struct Sample {
     us: [u16; MAX_PIECES],
@@ -42,6 +60,7 @@ struct Sample {
     target: f32,
 }
 
+/// Float network weights trained by Adam before quantizing into `WNNU` v1 format.
 #[derive(Clone)]
 struct Params {
     w: Vec<f32>,
@@ -74,6 +93,7 @@ impl Params {
         p
     }
 
+    /// Keep float weights inside the representable quantization range (especially `+-OUTPUT_WEIGHT_LIMIT`).
     fn clamp(&mut self) {
         for w in self.w.iter_mut().chain(self.b.iter_mut()) {
             *w = w.clamp(-WEIGHT_LIMIT, WEIGHT_LIMIT);
@@ -83,6 +103,7 @@ impl Params {
         }
     }
 
+    /// Quantize float weights (`QA`, `QB`) and serialize them as a `WNNU` v1 `.nnue` file.
     fn to_bytes(&self) -> Vec<u8> {
         let ft_weights: Vec<i16> = self
             .w
@@ -103,6 +124,7 @@ impl Params {
         nnue::serialize(&ft_weights, &ft_bias, &out_weights, out_bias)
     }
 
+    /// Dump raw little-endian `f32` weights so training can be resumed with `--resume`.
     fn save_raw(&self, path: &str) -> std::io::Result<()> {
         let mut bytes = Vec::with_capacity((self.w.len() + self.b.len() + self.ow.len() + 1) * 4);
         for v in self.w.iter().chain(&self.b).chain(&self.ow) {
@@ -112,6 +134,7 @@ impl Params {
         fs::write(path, bytes)
     }
 
+    /// Load a `.params` float checkpoint previously saved by [`Params::save_raw`].
     fn load_raw(path: &str) -> Result<Params, String> {
         let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         let expected = (INPUTS * HIDDEN + HIDDEN + 2 * HIDDEN + 1) * 4;
@@ -133,6 +156,7 @@ impl Params {
     }
 }
 
+/// Accumulated gradients and MSE loss over a mini-batch shard.
 struct Grad {
     w: Vec<f32>,
     b: Vec<f32>,
@@ -184,6 +208,7 @@ fn accumulate_side(params: &Params, features: &[u16], acc: &mut [f32; HIDDEN]) {
     }
 }
 
+/// Run a float forward pass for one position (returns raw logit before sigmoid).
 fn forward(params: &Params, sample: &Sample) -> f32 {
     let n = sample.count as usize;
     let mut us = [0f32; HIDDEN];
@@ -199,6 +224,7 @@ fn forward(params: &Params, sample: &Sample) -> f32 {
     out
 }
 
+/// Compute MSE loss and accumulate analytical gradients for one sample.
 fn backward(params: &Params, sample: &Sample, grad: &mut Grad) {
     let n = sample.count as usize;
     let mut us = [0f32; HIDDEN];
@@ -250,6 +276,7 @@ fn backward(params: &Params, sample: &Sample, grad: &mut Grad) {
     }
 }
 
+/// Standard Adam optimizer state (first/second moments and step counter).
 struct Adam {
     m: Params,
     v: Params,
@@ -307,6 +334,7 @@ impl Adam {
     }
 }
 
+/// Extract active NNUE feature indices from `pos` for both perspectives.
 fn build_sample(pos: &Position, target: f32) -> Sample {
     let stm = pos.side_to_move();
     let mut sample = Sample {
@@ -335,6 +363,7 @@ struct Line<'a> {
     wdl: f32,
 }
 
+/// Parse one `fen;score;wdl` line, normalizing `wdl` (`0/1/2`) to `0.0/0.5/1.0`.
 fn parse_line(line: &str) -> Option<Line<'_>> {
     let mut parts = line.split(';');
     let fen = parts.next()?;
@@ -343,6 +372,7 @@ fn parse_line(line: &str) -> Option<Line<'_>> {
     Some(Line { fen, score, wdl })
 }
 
+/// Blend search-score sigmoid (`lambda`) with game outcome (`1 - lambda`).
 fn target_of(line: &Line, lambda: f32) -> f32 {
     lambda * sigmoid(line.score / LABEL_SCALE) + (1.0 - lambda) * line.wdl
 }
@@ -362,6 +392,7 @@ struct Settings {
     resume: Option<String>,
 }
 
+/// Parse CLI flags (`--data`, `--out`, `--epochs`, `--batch`, `--lr`, `--lr-final`, `--lambda`, `--threads`, `--seed`, `--limit`, `--validation`, `--resume`).
 fn parse_settings() -> Result<Settings, String> {
     let mut s = Settings {
         data: Vec::new(),
@@ -408,6 +439,7 @@ fn parse_settings() -> Result<Settings, String> {
     Ok(s)
 }
 
+/// Compute mean squared error across `samples` in parallel.
 fn evaluate_set(params: &Params, samples: &[Sample], threads: usize) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -432,6 +464,7 @@ fn evaluate_set(params: &Params, samples: &[Sample], threads: usize) -> f64 {
     total / samples.len() as f64
 }
 
+/// Compare quantized integer inference against the float model on held-out validation FENs.
 fn quantization_report(params: &Params, fens: &[(String, f32)]) {
     let Ok(net) = nnue::Network::from_bytes(&params.to_bytes()) else {
         eprintln!("exported network failed to load");

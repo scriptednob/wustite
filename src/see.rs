@@ -1,55 +1,32 @@
 //! Static Exchange Evaluation (SEE).
 //!
-//! SEE answers: "if both sides keep capturing on this square, always using their
-//! least valuable attacker and stopping whenever stopping is better, does the side
-//! that starts the exchange come out ahead?" It does this without searching, by
-//! simulating the sequence of recaptures on one square.
+//! Simulates a chain of recaptures on a single square without running a search,
+//! always picking each side's cheapest attacker and stopping if recapturing
+//! would lose material.
 //!
-//! [`see_ge`] does not return the exchange value. It answers the boolean
-//! question "is the outcome at least `threshold`?", which is all the search needs
-//! and allows early exits as soon as the answer is certain.
+//! Instead of computing an exact centipawn value, [`see_ge`] only answers
+//! whether the exchange meets or beats `threshold`. That's all move ordering,
+//! quiescence, and pruning ever ask, and it lets us bail out early as soon as
+//! the result is decided.
 //!
-//! # Algorithm
+//! # How it works
 //!
-//! This is the *swap* algorithm, in the same formulation used by strong open
-//! engines:
+//! Uses the standard swap loop:
 //!
-//! 1. Start with `swap = captured value - threshold`. If that is already negative
-//!    the capture cannot reach the threshold even if it is never recaptured.
-//! 2. Then `swap = attacker value - swap`. If that is `<= 0`, the capture reaches
-//!    the threshold even if the capturing piece is immediately lost, so the
-//!    answer is yes.
-//! 3. Remove the moving piece from the occupancy and gather all attackers of the
-//!    target square. Alternate sides; each side picks its least valuable attacker
-//!    (pawn, knight, bishop, rook, queen, then king). After each capture,
-//!    sliders behind the removed piece are added to the attacker set (x-rays).
-//! 4. A `result` flag toggles each time a side has a legal recapture; the loop
-//!    ends when a side has none left, or when continuing cannot help it.
+//! 1. Start with `swap = captured - threshold`. If that's already negative, we
+//!    can't reach the threshold even for free.
+//! 2. Update `swap = attacker - swap`. If that's `<= 0`, we already clear the
+//!    threshold even if the attacker is lost right away.
+//! 3. Remove the moving piece from occupancy and alternate recaptures from
+//!    cheapest piece to most expensive, revealing any x-ray sliders behind each
+//!    removed piece as we go.
 //!
-//! # Pins
+//! Pinned pieces and their pinners are computed once up front for both sides.
+//! As long as a side's pinner is still on the board, its pinned pieces are
+//! masked out of the candidate attackers so SEE doesn't count illegal defenders.
 //!
-//! A piece that is pinned to its king cannot recapture off the pin line. Plain
-//! SEE ignores this and overestimates defenders. Here the pinned and pinning
-//! pieces of both sides are computed once up front, and while the pinning piece is
-//! still on the board, pinned pieces are removed from the candidate attackers.
-//!
-//! # Where it is used
-//!
-//! * **Move ordering**: captures with SEE >= 0 are "good" and searched before
-//!   quiet moves; the rest are "bad captures" and come last.
-//! * **Quiescence search**: captures that lose material by SEE are skipped.
-//! * **Pruning in the main search**: at shallow depth, moves whose SEE is below
-//!   a depth-scaled margin are not searched.
-//! * **ProbCut**: only captures that SEE says can beat the cut-off are tried.
-//!
-//! # Simplifications
-//!
-//! En passant, castling and promotion moves are not evaluated as exchanges:
-//! `see_ge` returns `0 >= threshold` for them. Piece values are the SEE-specific
-//! [`SEE_VALUE`] table, with a very large king value so that the king never
-//! "wins" a capture that would leave it en prise.
-//!
-//! # Examples
+//! Castling, en passant, and promotions aren't simulated here and just return
+//! `0 >= threshold`.
 //!
 //! ```
 //! use wustite::Position;
@@ -71,18 +48,13 @@ use crate::bitboard::Bitboard;
 use crate::board::Position;
 use crate::types::{Color, Move, PieceType};
 
-/// Piece values used by SEE, in centipawns: pawn 100, knight 320, bishop 330,
-/// rook 500, queen 900, king 20,000.
+/// Piece values in centipawns used by SEE (pawn through king), indexed by [`PieceType::idx`].
 ///
-/// The king's value is deliberately huge so that capturing with the king is only
-/// chosen when the square has no remaining enemy attackers. Indexed by
-/// [`crate::types::PieceType::idx`].
+/// The king gets 20,000 so it's only used to recapture when no opponent attacker
+/// is left on the square.
 pub const SEE_VALUE: [i32; 6] = [100, 320, 330, 500, 900, 20_000];
 
-/// Returns `(pinned, pinners)` for `color`: the pieces of either colour standing
-/// alone between an enemy slider and `color`'s king, restricted to cases where one
-/// of `color`'s own pieces is the blocker, and the enemy sliders doing the
-/// pinning.
+/// Find `(pinned, pinners)` for `color`: friendly single blockers and the enemy sliders pinning them.
 fn pin_info(pos: &Position, color: Color) -> (Bitboard, Bitboard) {
     let king = pos.king_square(color);
     let them = !color;
@@ -103,16 +75,11 @@ fn pin_info(pos: &Position, color: Color) -> (Bitboard, Bitboard) {
     (pinned, pinners)
 }
 
-/// Whether the exchange started by `mv` is worth at least `threshold` centipawns
-/// to the side making it.
+/// Return `true` if the exchange triggered by `mv` scores at least `threshold` centipawns.
 ///
-/// `threshold = 0` asks "does this capture at least break even?"; a positive
-/// threshold asks for a material win of that size, and a negative one tolerates
-/// a loss. Quiet moves are evaluated too (the captured value is zero), which the
-/// search uses to avoid moving a piece onto a square where it is simply lost.
-///
-/// En passant, castling and promotions return `0 >= threshold` without further
-/// analysis. See the [module documentation](crate::see) for the algorithm.
+/// Works on quiet moves too (captured value is 0), which search uses to spot
+/// pieces stepping onto undefended squares. Castling, en passant, and
+/// promotions skip simulation and return `0 >= threshold`.
 pub fn see_ge(pos: &Position, mv: Move, threshold: i32) -> bool {
     if mv.is_castle() || mv.is_en_passant() || mv.is_promotion() {
         return 0 >= threshold;

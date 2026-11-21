@@ -1,3 +1,8 @@
+//! Perft integration tests against the standard suite and python-chess fixtures.
+//!
+//! Debug builds cap node counts at 1M so `cargo test` stays snappy; release
+//! builds run the full 200M-node suite.
+
 use wustite::Position;
 use wustite::perft::{SUITE, perft};
 

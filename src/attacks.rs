@@ -1,53 +1,20 @@
-//! Attack sets for every piece, computed from lookup tables built at compile time.
+//! Compile-time attack tables and ray geometry.
 //!
-//! Nothing in this module is computed at run time and there is no
-//! initialisation function: all tables are `static` values produced by `const fn`
-//! evaluation, so they live in the binary's read-only data, and the first call
-//! costs the same as any other.
+//! Every table in this module is built by `const fn` evaluation and lives in
+//! read-only memory, so there's no runtime initialization step.
 //!
-//! # Leapers
-//!
-//! Knights, kings and pawns attack a fixed pattern from each square regardless of
-//! other pieces. Their sets are stored as one `u64` per square (and per colour for
-//! pawns). See [`knight_attacks`], [`king_attacks`] and [`pawn_attacks`].
-//!
-//! # Sliders
-//!
-//! Rooks and bishops depend on which squares are occupied along their rays, so
-//! the answer is a function of the origin square and the occupancy. The engine
-//! uses a perfect hash of the relevant occupancy bits, in one of two flavours
-//! chosen when the crate is compiled:
-//!
-//! * **Magic bitboards** (default). The *relevant* occupancy for a square is the
-//!   set of ray squares excluding the board edge (an edge square cannot block
-//!   anything beyond it). Multiplying `occupancy & mask` by a per-square magic
-//!   constant and shifting right by `64 - bits` gives an index into that square's
-//!   slice of a shared attack table. The magic constants live in
-//!   [`crate::magic_numbers`] and were found with `examples/find_magics.rs`.
-//! * **PEXT** (when built with `-C target-feature=+bmi2` on x86-64). The BMI2
-//!   instruction `pext` extracts exactly the mask bits of the occupancy and packs
-//!   them into the low bits of a register. That packed value is itself a perfect
-//!   index, so no multiplication or magic constant is needed. [`USE_PEXT`]
-//!   reports which variant was compiled in. Note that `pext` is microcoded and
-//!   slow on AMD Zen 1 and Zen 2, where the magic variant is faster.
-//!
-//! Table sizes are 102,400 entries for rooks and 5,248 for bishops (about 819 KB
-//! and 42 KB of `u64`), the standard sizes for fully compact "fancy" magic
-//! tables.
-//!
-//! The attack table contents are generated with *hyperbola quintessence*, a
-//! subtraction-based trick that computes a line's attacks from an occupancy
-//! without looping over squares, and `const` evaluation asserts that no two
-//! occupancies that need different answers share an index. A bad magic constant
-//! fails the build instead of silently producing wrong moves.
-//!
-//! # Geometry tables
-//!
-//! [`between`] and [`line`](fn@line) are two 64 x 64 tables used for pins and check
-//! evasions: the squares strictly between two aligned squares, and the whole
-//! board line through them.
-//!
-//! # Examples
+//! * **Leapers** ([`knight_attacks`], [`king_attacks`], [`pawn_attacks`]):
+//!   plain 64-entry tables.
+//! * **Sliders** ([`rook_attacks`], [`bishop_attacks`], [`queen_attacks`]):
+//!   compact fancy tables (102,400 rook entries and 5,248 bishop entries),
+//!   populated at compile time via hyperbola quintessence. By default lookups
+//!   use the magic multipliers in [`crate::magic_numbers`]; when compiled on
+//!   x86-64 with `+bmi2`, they use hardware `pext` instead (check [`USE_PEXT`]).
+//!   A bad magic multiplier panics at compile time rather than producing wrong
+//!   moves. Note that `pext` is microcoded on AMD Zen 1/2, where magic
+//!   bitboards are faster.
+//! * **Geometry** ([`between`], [`line`](fn@line)): 64x64 tables for pins and
+//!   check evasions.
 //!
 //! ```
 //! use wustite::attacks::{knight_attacks, rook_attacks, between};
@@ -68,13 +35,10 @@ use crate::bitboard::Bitboard;
 use crate::magic_numbers::{BISHOP_MAGICS, ROOK_MAGICS};
 use crate::types::{Color, PieceType, Square};
 
-/// Whether slider attacks use the BMI2 `pext` instruction instead of magic multiplication.
-///
-/// `true` only when the crate was compiled for x86-64 with the `bmi2` target
-/// feature, for example `RUSTFLAGS="-C target-cpu=native"` on a CPU that has it.
+/// `true` when compiled for x86-64 with BMI2 so slider lookups use `pext` instead of magic multiplication.
 pub const USE_PEXT: bool = cfg!(all(target_arch = "x86_64", target_feature = "bmi2"));
 
-/// Knight move offsets as `(file, rank)` deltas.
+/// Knight `(file, rank)` jump offsets.
 const KNIGHT_DELTAS: [(i8, i8); 8] = [
     (1, 2),
     (2, 1),
@@ -85,7 +49,7 @@ const KNIGHT_DELTAS: [(i8, i8); 8] = [
     (-2, 1),
     (-1, 2),
 ];
-/// King move offsets as `(file, rank)` deltas.
+/// King `(file, rank)` step offsets.
 const KING_DELTAS: [(i8, i8); 8] = [
     (1, 0),
     (1, 1),
@@ -114,12 +78,12 @@ const ALL_DIRS: [(i8, i8); 8] = [
 const ROOK_TABLE_SIZE: usize = 102_400;
 const BISHOP_TABLE_SIZE: usize = 5_248;
 
-/// Whether a file and rank pair is inside the 8x8 board.
+/// Check whether `(file, rank)` lies inside the 8x8 board.
 const fn on_board(file: i8, rank: i8) -> bool {
     file >= 0 && file < 8 && rank >= 0 && rank < 8
 }
 
-/// Attack set of a piece that jumps by fixed offsets, for one origin square.
+/// Compute fixed-offset attack bits for a single square.
 const fn leaper_attacks(sq: usize, deltas: &[(i8, i8)]) -> u64 {
     let file = (sq % 8) as i8;
     let rank = (sq / 8) as i8;
@@ -136,11 +100,7 @@ const fn leaper_attacks(sq: usize, deltas: &[(i8, i8)]) -> u64 {
     out
 }
 
-/// Reference slider attacks for one square: walks each direction until it leaves
-/// the board or hits an occupied square, which is included in the result.
-///
-/// This slow, obviously correct version is the oracle the unit tests compare the
-/// fast lookup against.
+/// Slow ray-walk reference used to build geometry tables and verify slider lookups in tests.
 const fn ray_attacks(sq: usize, occ: u64, dirs: &[(i8, i8)]) -> u64 {
     let mut out = 0u64;
     let mut d = 0;
@@ -161,9 +121,7 @@ const fn ray_attacks(sq: usize, occ: u64, dirs: &[(i8, i8)]) -> u64 {
     out
 }
 
-/// The relevant occupancy mask for a slider on one square: every ray square
-/// except the last one in each direction, because the final square on a ray can
-/// never be a blocker that changes the result.
+/// Relevant blocker mask for a slider on `sq` (excludes board edge squares that can't block further rays).
 const fn slider_mask(sq: usize, dirs: &[(i8, i8)]) -> u64 {
     let mut out = 0u64;
     let mut d = 0;
@@ -181,13 +139,7 @@ const fn slider_mask(sq: usize, dirs: &[(i8, i8)]) -> u64 {
     out
 }
 
-/// Hyperbola quintessence for a single line.
-///
-/// With `o` the occupancy on the line, `s` the slider bit and `r(x)` bit
-/// reversal, the attacks along that line are `((o - 2s) ^ r(r(o) - 2r(s))) & line`.
-/// The subtraction propagates a borrow from the slider up to the first blocker,
-/// flipping exactly the squares in between; the reversed copy does the same in
-/// the opposite direction. Used only to fill the tables at compile time.
+/// Hyperbola quintessence along one line (`((o - 2s) ^ rev(rev(o) - 2*rev(s))) & line`), used during compile-time table fill.
 const fn hyperbola(occ: u64, line_mask: u64, slider: u64) -> u64 {
     let forward = occ & line_mask;
     let reverse = forward.reverse_bits();
@@ -196,7 +148,7 @@ const fn hyperbola(occ: u64, line_mask: u64, slider: u64) -> u64 {
     (forward ^ reverse.reverse_bits()) & line_mask
 }
 
-/// The two lines a rook (orthogonals) or bishop (diagonals) travels along from one square, used by [`hyperbola`].
+/// Pair of full empty-board lines through `sq` for a rook or bishop.
 const fn slider_lines(sq: usize, rook: bool) -> (u64, u64) {
     if rook {
         (
@@ -211,7 +163,7 @@ const fn slider_lines(sq: usize, rook: bool) -> (u64, u64) {
     }
 }
 
-/// Builds a 64-entry attack table for a leaper from its offsets.
+/// Build a 64-square attack table for a leaper.
 const fn build_leaper_table(deltas: &[(i8, i8)]) -> [u64; 64] {
     let mut table = [0u64; 64];
     let mut sq = 0;
@@ -222,19 +174,17 @@ const fn build_leaper_table(deltas: &[(i8, i8)]) -> [u64; 64] {
     table
 }
 
-/// Knight attacks indexed by origin square.
+/// Precomputed knight attacks by square.
 static KNIGHT_TABLE: [u64; 64] = build_leaper_table(&KNIGHT_DELTAS);
-/// King attacks indexed by origin square.
+/// Precomputed king attacks by square.
 static KING_TABLE: [u64; 64] = build_leaper_table(&KING_DELTAS);
-/// Pawn capture targets indexed by colour, then origin square.
+/// Precomputed pawn capture masks indexed `[color][square]`.
 static PAWN_TABLE: [[u64; 64]; 2] = [
     build_leaper_table(&WHITE_PAWN_DELTAS),
     build_leaper_table(&BLACK_PAWN_DELTAS),
 ];
 
-/// Per-square slider lookup parameters: the relevant-occupancy mask, the magic
-/// multiplier, the offset of this square's slice in the shared attack table, and
-/// the right-shift that turns the product into an index.
+/// Per-square lookup metadata for magic/PEXT slider tables.
 #[derive(Clone, Copy)]
 #[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
 struct MagicEntry {
@@ -244,8 +194,7 @@ struct MagicEntry {
     shift: u32,
 }
 
-/// One complete slider lookup structure (rooks or bishops): 64 [`MagicEntry`]
-/// records and a flat attack array of `N` entries shared by all squares.
+/// Flat shared attack table plus 64 per-square [`MagicEntry`] headers.
 struct SliderTable<const N: usize> {
     entries: [MagicEntry; 64],
     attacks: [u64; N],
@@ -310,16 +259,16 @@ impl<const N: usize> SliderTable<N> {
     }
 }
 
-/// The rook attack table, built at compile time.
+/// Compile-time rook attack table.
 #[allow(long_running_const_eval)]
 static ROOK_SLIDERS: SliderTable<ROOK_TABLE_SIZE> =
     SliderTable::build(true, &ROOK_DIRS, &ROOK_MAGICS);
-/// The bishop attack table, built at compile time.
+/// Compile-time bishop attack table.
 #[allow(long_running_const_eval)]
 static BISHOP_SLIDERS: SliderTable<BISHOP_TABLE_SIZE> =
     SliderTable::build(false, &BISHOP_DIRS, &BISHOP_MAGICS);
 
-/// The `between` and `line` tables, each 64 x 64 `u64` values.
+/// Precomputed 64x64 `between` and `line` tables.
 struct Geometry {
     between: [[u64; 64]; 64],
     line: [[u64; 64]; 64],
@@ -357,27 +306,25 @@ impl Geometry {
     }
 }
 
-/// The geometry tables, built at compile time.
+/// Compile-time geometry tables.
 static GEOMETRY: Geometry = Geometry::build();
 
-/// Squares a knight on `sq` attacks.
+/// Squares attacked by a knight on `sq`.
 #[inline(always)]
 pub fn knight_attacks(sq: Square) -> Bitboard {
     Bitboard(KNIGHT_TABLE[sq.idx()])
 }
 
-/// Squares a king on `sq` attacks.
+/// Squares attacked by a king on `sq`.
 #[inline(always)]
 pub fn king_attacks(sq: Square) -> Bitboard {
     Bitboard(KING_TABLE[sq.idx()])
 }
 
-/// Squares a pawn of `color` on `sq` attacks (its two diagonal capture targets,
-/// fewer on the edge files). The result does not include push squares.
+/// Diagonal capture targets of a `color` pawn on `sq` (excludes pushes).
 ///
-/// The same table answers the reverse question: the squares from which an enemy
-/// pawn would attack `sq` are `pawn_attacks(!color, sq)`. Position code uses that
-/// to find pawn attackers without a loop.
+/// Works in reverse too: enemy pawns that attack `sq` sit on
+/// `pawn_attacks(!color, sq)`.
 ///
 /// ```
 /// use wustite::attacks::pawn_attacks;
@@ -392,34 +339,28 @@ pub fn pawn_attacks(color: Color, sq: Square) -> Bitboard {
     Bitboard(PAWN_TABLE[color.idx()][sq.idx()])
 }
 
-/// Squares a rook on `sq` attacks given the occupancy `occ`.
+/// Squares a rook on `sq` attacks for occupancy `occ`.
 ///
-/// Each ray extends up to and including the first occupied square, so the result
-/// includes blockers of either colour; callers mask out their own pieces.
-/// `occ` may or may not include the rook's own square, since it is not part of
-/// the relevant mask.
+/// Includes the first blocker in each direction (friendly or enemy), so callers
+/// mask out their own pieces. Whether `sq` itself is set in `occ` doesn't matter.
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     Bitboard(ROOK_SLIDERS.lookup(sq, occ.0))
 }
 
-/// Squares a bishop on `sq` attacks given the occupancy `occ`. Same conventions as [`rook_attacks`].
+/// Squares a bishop on `sq` attacks for occupancy `occ`. Same conventions as [`rook_attacks`].
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     Bitboard(BISHOP_SLIDERS.lookup(sq, occ.0))
 }
 
-/// Squares a queen on `sq` attacks: the union of [`rook_attacks`] and [`bishop_attacks`].
+/// Squares a queen on `sq` attacks (`rook_attacks | bishop_attacks`).
 #[inline(always)]
 pub fn queen_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     rook_attacks(sq, occ) | bishop_attacks(sq, occ)
 }
 
-/// Attacks of a non-pawn piece type from `sq`, dispatching to the specific lookup.
-///
-/// Pawns return the empty set because their attacks depend on colour; use
-/// [`pawn_attacks`] for them. This function is what move generation calls for
-/// knights, bishops, rooks and queens in a single loop.
+/// Dispatch attack lookup for any non-pawn piece type. Returns empty for pawns (use [`pawn_attacks`]).
 #[inline(always)]
 pub fn attacks_bb(piece_type: PieceType, sq: Square, occ: Bitboard) -> Bitboard {
     match piece_type {
@@ -432,21 +373,13 @@ pub fn attacks_bb(piece_type: PieceType, sq: Square, occ: Bitboard) -> Bitboard 
     }
 }
 
-/// The squares strictly between `a` and `b` when they share a rank, file or
-/// diagonal, and the empty set otherwise (including when they are adjacent).
-///
-/// Used to find which pieces block a check or pin a piece, and which squares a
-/// checked king's side may interpose on.
+/// Squares strictly between `a` and `b` if they share a rank, file, or diagonal; otherwise empty.
 #[inline(always)]
 pub fn between(a: Square, b: Square) -> Bitboard {
     Bitboard(GEOMETRY.between[a.idx()][b.idx()])
 }
 
-/// The entire board line (rank, file or diagonal) through `a` and `b`, including
-/// both squares, or the empty set when they are not aligned.
-///
-/// A piece pinned to its king may move only along this line, so move generation
-/// intersects a pinned piece's destinations with `line(king, piece)`.
+/// Full rank, file, or diagonal passing through `a` and `b` (inclusive), or empty if unaligned.
 #[inline(always)]
 pub fn line(a: Square, b: Square) -> Bitboard {
     Bitboard(GEOMETRY.line[a.idx()][b.idx()])

@@ -1,10 +1,31 @@
+"""Play paired UCI engine matches with live Elo estimates and SPRT stopping.
+
+Each opening in the book is played twice with colors swapped so any opening
+bias cancels out. Supports either a fixed time per move (`--movetime`) or a
+standard base + increment clock (`--base`, `--inc`).
+
+Examples:
+    # Test two NNUE files with the same binary
+    python3 tools/match.py --bin target/release/wustite --openings tools/openings.txt \
+        --movetime 60 --a "evalfile=new.nnue" --b "evalfile=nets/wustite.nnue"
+
+    # Compare two different builds
+    python3 tools/match.py --bin ./wustite_new --bin-b ./wustite_base \
+        --openings tools/openings.txt --base 5 --inc 0.05 --concurrency 4
+
+Requires python-chess (`pip install chess`).
+"""
+
 import argparse, math, random, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import chess
 
 
 class Engine:
+    """Small UCI client wrapping a single engine process."""
+
     def __init__(self, path, options, overhead):
+        """Start the engine binary, finish the UCI handshake, and apply options."""
         self.proc = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.send("uci")
@@ -16,10 +37,12 @@ class Engine:
         self.read_until("readyok")
 
     def send(self, line):
+        """Write one command line to the engine's stdin."""
         self.proc.stdin.write(line + "\n")
         self.proc.stdin.flush()
 
     def read_until(self, prefix):
+        """Read stdout lines until one starts with `prefix`."""
         lines = []
         while True:
             line = self.proc.stdout.readline()
@@ -31,11 +54,17 @@ class Engine:
                 return lines
 
     def newgame(self):
+        """Send `ucinewgame` and wait for `readyok`."""
         self.send("ucinewgame")
         self.send("isready")
         self.read_until("readyok")
 
     def go(self, start_fen, moves, go_cmd):
+        """Search from `start_fen` + `moves` and return `(bestmove, score, elapsed_s, depth)`.
+
+        Mate scores are turned into +/-10000 cp so adjudication can treat them
+        just like big centipawn leads.
+        """
         self.send(f"position fen {start_fen} moves {' '.join(moves)}" if moves else f"position fen {start_fen}")
         t0 = time.perf_counter()
         self.send(go_cmd)
@@ -58,6 +87,7 @@ class Engine:
         return best, score, elapsed, depth
 
     def close(self):
+        """Tell the engine to quit, falling back to `kill()` after 5 seconds."""
         try:
             self.send("quit")
             self.proc.wait(timeout=5)
@@ -66,6 +96,16 @@ class Engine:
 
 
 def play_game(path_white, path_black, opts_white, opts_black, opening, args, game_id):
+    """Play one game from `opening` and return `(winner, reason, depths)`.
+
+    `winner` is `"white"`, `"black"`, or `"draw"`. `reason` explains how the
+    game ended: `"mate"`, `"rule"` (stalemate, insufficient material, 3-/5-fold
+    repetition, 50-move), `"maxplies"`, `"time"`, `"badmove"`, `"illegal:<mv>"`,
+    or `"adjudicated"`.
+
+    A game is adjudicated once both engines agree for 6 straight plies that one
+    side is ahead by at least 900 cp.
+    """
     ew = Engine(path_white, opts_white, args.overhead)
     eb = Engine(path_black, opts_black, args.overhead)
     try:
@@ -125,6 +165,7 @@ def play_game(path_white, path_black, opts_white, opts_black, opening, args, gam
 
 
 def llr(w, d, l, elo0, elo1):
+    """Normal-approximation log-likelihood ratio for SPRT(elo0, elo1)."""
     n = w + d + l
     if n == 0:
         return 0.0
@@ -138,6 +179,7 @@ def llr(w, d, l, elo0, elo1):
 
 
 def elo_estimate(w, d, l):
+    """Estimate `(elo_diff, ci95_half_width)` from W/D/L counts."""
     n = w + d + l
     if n == 0:
         return 0.0, 0.0
@@ -153,6 +195,7 @@ def elo_estimate(w, d, l):
 
 
 def parse_opts(text):
+    """Parse comma-separated `name=value` UCI options into `(name, value)` tuples."""
     out = []
     for item in [t for t in text.split(",") if t]:
         k, v = item.split("=")
@@ -161,28 +204,32 @@ def parse_opts(text):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", required=True)
-    ap.add_argument("--bin-b", default="")
-    ap.add_argument("--a", default="")
-    ap.add_argument("--b", default="")
-    ap.add_argument("--openings", required=True)
-    ap.add_argument("--movetime", type=int, default=0)
-    ap.add_argument("--base", type=float, default=5.0)
-    ap.add_argument("--inc", type=float, default=0.05)
-    ap.add_argument("--overhead", type=int, default=5)
-    ap.add_argument("--games", type=int, default=600)
-    ap.add_argument("--concurrency", type=int, default=2)
-    ap.add_argument("--elo0", type=float, default=0.0)
-    ap.add_argument("--elo1", type=float, default=10.0)
-    ap.add_argument("--max-plies", type=int, default=300)
-    ap.add_argument("--no-sprt", action="store_true")
-    ap.add_argument("--label", default="")
+    """Parse CLI flags, run paired games across a thread pool, and print the verdict."""
+    ap = argparse.ArgumentParser(
+        description="Run paired UCI engine matches with Elo estimation and SPRT."
+    )
+    ap.add_argument("--bin", required=True, help="Engine A binary (also used for B unless --bin-b is set).")
+    ap.add_argument("--bin-b", default="", help="Optional separate binary for engine B.")
+    ap.add_argument("--a", default="", help="Comma-separated UCI options for A (e.g. 'nmp=1,threads=2').")
+    ap.add_argument("--b", default="", help="Comma-separated UCI options for B.")
+    ap.add_argument("--openings", required=True, help="Text file with one opening FEN per line.")
+    ap.add_argument("--movetime", type=int, default=0, help="Fixed time per move in ms (overrides --base/--inc).")
+    ap.add_argument("--base", type=float, default=5.0, help="Base clock time in seconds.")
+    ap.add_argument("--inc", type=float, default=0.05, help="Increment per move in seconds.")
+    ap.add_argument("--overhead", type=int, default=5, help="Move Overhead in ms sent to both engines.")
+    ap.add_argument("--games", type=int, default=600, help="Max number of games to play.")
+    ap.add_argument("--concurrency", type=int, default=2, help="Games to run in parallel.")
+    ap.add_argument("--elo0", type=float, default=0.0, help="SPRT H0 Elo bound.")
+    ap.add_argument("--elo1", type=float, default=10.0, help="SPRT H1 Elo bound.")
+    ap.add_argument("--max-plies", type=int, default=300, help="Adjudicate as a draw after this many plies.")
+    ap.add_argument("--no-sprt", action="store_true", help="Disable SPRT early stopping and play all --games.")
+    ap.add_argument("--label", default="", help="Tag printed at the start of status lines.")
     args = ap.parse_args()
 
     openings = [l.strip() for l in open(args.openings) if l.strip()]
     opts_a = parse_opts(args.a)
     opts_b = parse_opts(args.b)
+    # Wald bounds for alpha = beta = 0.05 (~ -2.94, +2.94).
     lower, upper = math.log(0.05 / 0.95), math.log(0.95 / 0.05)
 
     w = d = l = 0
@@ -197,6 +244,7 @@ def main():
     def job(i):
         if stop.is_set():
             return None
+        # Play each opening twice, flipping colors on odd game indices.
         opening = openings[(i // 2) % len(openings)]
         a_white = (i % 2 == 0)
         ow, ob = (opts_a, opts_b) if a_white else (opts_b, opts_a)

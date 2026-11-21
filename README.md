@@ -11,80 +11,82 @@
 
 </div>
 
-Wustite is an open source UCI chess engine written in Rust with no dependencies, using an NNUE evaluation that is trained entirely with the tools in this repository.
+Wustite is a UCI chess engine written in Rust with zero external crates. Its NNUE network is generated and trained from scratch using the Rust tools in `examples/`, and self-play matches are handled by a couple of small Python scripts in `tools/`.
 
-Every module of the library explains what it does and why, with runnable examples. The whole reference is on [docs.rs](https://docs.rs/wustite).
+If you want to browse the library internals, the rustdoc pages are published on [docs.rs](https://docs.rs/wustite).
 
 ## Strength
 
-Wustite is not on any rating list yet. The only results so far come from matches against its own earlier versions, played with `tools/match.py` and judged with an SPRT.
+Wustite isn't on CCRL or any other rating list yet. These numbers come from self-play SPRT matches against earlier versions using `tools/match.py`:
 
-| Test                                     | Time control | Games | Elo difference |
-| ---------------------------------------- | ------------ | ----- | -------------- |
-| NNUE against the classical eval          | 100 ms/move  | 89    | +144 ±66       |
-| Current network against the first        | 60 ms/move   | 147   | +105 ±48       |
-| Version 0.2.0 against the classical eval | 100 ms/move  | 100   | +269 ±74       |
-| 2 threads against 1 thread               | 100 ms/move  | 100   | +131 ±49       |
+| Match | Time control | Games | Elo |
+| --- | --- | --- | --- |
+| NNUE vs. classical PeSTO | 100 ms/move | 89 | +144 ±66 |
+| Current net vs. first net | 60 ms/move | 147 | +105 ±48 |
+| v0.2.0 vs. classical PeSTO | 100 ms/move | 100 | +269 ±74 |
+| 2 threads vs. 1 thread | 100 ms/move | 100 | +131 ±49 |
 
-## Features
+## What's inside
 
-| Area       | What it uses                                                                                                                         |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Board      | Bitboards, copy-make, incremental Zobrist hash, fully legal move generation with no allocation                                       |
-| Attacks    | Magic bitboards, or PEXT when built with BMI2, with every table built at compile time                                                |
-| Search     | Principal variation search, iterative deepening, aspiration windows, quiescence search, Lazy SMP                                     |
-| Pruning    | Null move, reverse futility, futility, late move pruning, late move reductions, SEE pruning, internal iterative reduction            |
-| Extensions | Check and singular extensions                                                                                                        |
-| Ordering   | Transposition table move, SEE-sorted captures, killers, counter move, butterfly and continuation history                             |
-| Evaluation | NNUE with 768 inputs per side, 128 hidden units and SCReLU, updated incrementally, with AVX2 and AVX-512 code. PeSTO as the fallback |
-| Table      | Lockless shared transposition table with one cache line per bucket                                                                   |
-| Protocol   | UCI with pondering, `Hash`, `Threads` and `Move Overhead`                                                                            |
+The board uses bitboards, copy-make, and an incremental Zobrist hash. Move generation only emits legal moves straight into a stack-allocated list, so nothing hits the heap during search. Slider attacks come from compile-time magic bitboards, or BMI2 `pext` when built with BMI2 enabled.
+
+Search is fail-soft PVS with iterative deepening, aspiration windows, quiescence search, and Lazy SMP. It uses null-move pruning (with verification at higher depths), reverse futility, futility, late move pruning, late move reductions, SEE pruning, internal iterative reduction, check extensions, and singular extensions. Moves are ordered by TT move, SEE-split captures (MVV-LVA), two killers, a counter move, butterfly history, and 1-/2-ply continuation history.
+
+Evaluation is a `(768 -> 128) x 2 -> 1` SCReLU NNUE updated incrementally as moves are made, with AVX-512BW and AVX2 paths on x86-64. PeSTO stays in the repo as a fallback (and for bootstrapping training data), alongside a small mop-up rule for bare-king endings where the net doesn't see enough examples.
+
+The transposition table is lockless (Hyatt's XOR trick) and shared between threads in 64-byte cache-line buckets. The UCI front end supports `Hash`, `Threads`, `Move Overhead`, `Ponder`, `UseNNUE`, `EvalFile`, and `Clear Hash`.
 
 ## Getting started
 
-### Precompiled binaries
+### Prebuilt binaries
 
-Binaries for Windows, macOS and Linux are on the [releases page](https://github.com/scriptednob/wustite/releases). They are generic builds that run on any CPU of the right architecture. For the best speed, build from source for your own machine.
+Binaries for Windows, macOS, and Linux are up on the [releases page](https://github.com/scriptednob/wustite/releases). Those are portable builds so they run anywhere, though building locally for your CPU will be faster.
 
-There are also installers. On Linux and macOS:
+Linux and macOS installer:
 
-```
+```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/scriptednob/wustite/releases/latest/download/wustite-installer.sh | sh
 ```
 
-On Windows, in PowerShell:
+Windows (PowerShell):
 
-```
+```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/scriptednob/wustite/releases/latest/download/wustite-installer.ps1 | iex"
 ```
 
-If you have Rust installed, `cargo install wustite` also works.
+Or with Cargo:
+
+```sh
+cargo install wustite
+```
 
 ### Building from source
 
-You need a stable Rust toolchain, version 1.85 or newer.
+Requires Rust 1.85 or newer:
 
-```
+```sh
 cargo build --release
 ```
 
-The executable is `target/release/wustite`. To build for your own CPU:
+To target your own CPU (enables `pext` if you have BMI2, and AVX-512BW on Rust 1.89+):
 
-```
+```sh
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-This turns on PEXT attack lookups when the CPU has BMI2, and the AVX-512 network code when it has AVX-512 (that part needs Rust 1.89 or newer). PEXT is slow on AMD Zen 1 and Zen 2, so on those CPUs add `-C target-feature=-bmi2`.
+Watch out on AMD Zen 1 and Zen 2: `pext` is microcoded there and slower than magic multiplication. Disable BMI2 on those chips:
 
-Without any flags the engine uses magic bitboards and picks AVX2 at runtime for the network. On other architectures, ARM included, it uses plain scalar code, which works but is slower.
-
-### Usage
-
-Wustite has no board or GUI of its own. It needs a UCI front end such as [Cute Chess](https://github.com/cutechess/cutechess), [Arena](http://www.playwitharena.de/) or [En Croissant](https://github.com/franciscoBSalgueiro/en-croissant), and it also works with [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot).
-
-You can also talk to it directly from a terminal:
-
+```sh
+RUSTFLAGS="-C target-cpu=native -C target-feature=-bmi2" cargo build --release
 ```
+
+Without extra flags, x86-64 builds use magic bitboards and detect AVX2 at runtime. Other architectures (including ARM) fall back to scalar code for the network.
+
+## Usage
+
+Wustite has no built-in GUI. Load it into a UCI front end like [Cute Chess](https://github.com/cutechess/cutechess), [Arena](http://www.playwitharena.de/), [En Croissant](https://github.com/franciscoBSalgueiro/en-croissant), or [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot), or talk to it straight from a terminal:
+
+```text
 wustite
 uci
 position startpos moves e2e4 e7e5
@@ -93,89 +95,84 @@ go movetime 1000
 
 ### UCI options
 
-| Name          | Default      | Description                                                   |
-| ------------- | ------------ | ------------------------------------------------------------- |
-| Hash          | 16           | Transposition table size in MB (1 to 65536)                   |
-| Threads       | 1            | Number of search threads (1 to 256)                           |
-| Move Overhead | 30           | Time in ms to keep in reserve for each move                   |
-| Ponder        | false        | Allow the GUI to send `go ponder`                             |
-| UseNNUE       | true         | Use the network. When off, the engine uses the classical eval |
-| EvalFile      | `<internal>` | Path to a network file. `<internal>` loads the built-in one   |
-| Clear Hash    |              | Empty the transposition table                                 |
+| Option | Default | What it does |
+| --- | --- | --- |
+| `Hash` | `16` | Transposition table size in MiB (1 to 65536) |
+| `Threads` | `1` | Lazy SMP worker threads (1 to 256) |
+| `Move Overhead` | `30` | Milliseconds held back per move for GUI/pipe lag |
+| `Ponder` | `false` | Let the GUI send `go ponder` |
+| `UseNNUE` | `true` | Turn off to fall back to the classical PeSTO eval |
+| `EvalFile` | `<internal>` | Path to a `.nnue` file, or `<internal>` for the embedded net |
+| `Clear Hash` | | Empty the transposition table |
 
-Every search switch and margin can also be set with `setoption`, for example `setoption name NMP value 0`. They are listed in the [`search`](https://docs.rs/wustite/latest/wustite/search/struct.Params.html) and [`uci`](https://docs.rs/wustite/latest/wustite/uci/index.html) documentation.
+Internal search switches and margins can also be changed through `setoption` using integer values (`0` = off, anything else = on), for instance `setoption name NMP value 0`. They aren't advertised in `uci` since they're mainly for A/B testing changes. See `wustite::search::Params` and `wustite::uci` for the full list.
 
-### Custom commands
+### CLI and debug commands
 
-These work from the command line, for example `wustite perft 5`.
+Run directly from the shell:
 
-| Command                | Description                                               |
-| ---------------------- | --------------------------------------------------------- |
-| `bench [depth]`        | Search a fixed set of positions and print nodes and speed |
-| `perft <depth> [fen]`  | Count leaf nodes at a given depth                         |
-| `divide <depth> [fen]` | Same as `perft`, with a count for each root move          |
-| `suite [depth]`        | Run the built-in perft suite and check the results        |
+| Command | What it does |
+| --- | --- |
+| `wustite bench [depth]` | Fixed-depth benchmark across built-in positions (default depth 12) |
+| `wustite perft <depth> [fen]` | Count leaf nodes from `startpos` or a FEN |
+| `wustite divide <depth> [fen]` | Same as `perft`, broken down per root move |
+| `wustite suite [max-depth]` | Check the built-in perft positions (default max depth 5) |
 
-Inside a UCI session these are available as well: `d` prints the board, `eval` prints the static evaluation, `bench [depth]` runs the benchmark and `go perft <depth>` counts nodes.
-
-## Documentation
-
-The API reference is generated from the source with rustdoc and published on [docs.rs/wustite](https://docs.rs/wustite). To read it offline:
-
-```
-cargo doc --no-deps --open
-```
-
-The crate page has a module map and a walk-through of how one move goes from the GUI to the board. The chess-specific modules each start with a long explanation of the technique they implement:
-
-| Module                                                                    | Read it for                                                              |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| [`board`](https://docs.rs/wustite/latest/wustite/board/index.html)        | Copy-make, FEN parsing, what `make_move` updates                         |
-| [`movegen`](https://docs.rs/wustite/latest/wustite/movegen/index.html)    | How legality is built into generation: pins, evasions, en passant        |
-| [`attacks`](https://docs.rs/wustite/latest/wustite/attacks/index.html)    | Magic bitboards and PEXT                                                 |
-| [`search`](https://docs.rs/wustite/latest/wustite/search/index.html)      | Every pruning, reduction and extension, with the formulas                |
-| [`tt`](https://docs.rs/wustite/latest/wustite/tt/index.html)              | The lockless table and its replacement policy                            |
-| [`nnue`](https://docs.rs/wustite/latest/wustite/nnue/index.html)          | The network, incremental updates, quantisation and the file format       |
-| [`uci`](https://docs.rs/wustite/latest/wustite/uci/index.html)            | Every command, option and the threading model                            |
+Inside a UCI session you can also run `d` (prints the board, FEN, and hash), `eval` (static eval), `bench [depth]` (default 10), and `go perft <depth>`.
 
 ## Training a network
 
-The network has 768 inputs for each side (piece, colour and square), 128 hidden units, SCReLU and a single output. The hidden layer is updated incrementally as moves are made. Positions where one side has only a king and the other a rook or queen skip the network and use a simple mop-up evaluation, because the network has not seen enough of them.
+The network takes 768 binary inputs per side (own/enemy, piece type, square), maps them to 128 hidden units with SCReLU, and produces one centipawn score. Bare-king endings against a rook or queen skip the net and use the mop-up eval instead, since self-play doesn't generate enough of them for the net to convert cleanly.
 
-The data generator and the trainer are in `examples/` and need nothing besides Rust.
+Both the self-play generator and trainer live in `examples/` and only need Rust:
 
-```
+```sh
 cargo run --release --example datagen -- --out data.txt --threads 4 --positions 2000000 --nodes 8000
 cargo run --release --example train -- --data data.txt --out net.nnue
 ```
 
-`datagen` plays self-play games at a fixed node count and writes `fen;score;result` lines. Pass `--net FILE` to label positions with a network instead of the classical evaluation. `train` fits a network with Adam, writes a `.nnue` file and prints how far the quantized network is from the float one. Building the examples with `target-cpu=native` makes training much faster. Training on a million positions takes a few minutes, but generating them is slow: about 400 positions per second on two cores.
+`datagen` plays fixed-node self-play games after 8 or 9 random opening plies and writes `fen;score;wdl` lines. It defaults to PeSTO; pass `--net FILE` to label games with an existing network. `train` fits the weights with Adam, writes `net.nnue` plus a float checkpoint (`net.nnue.params` for `--resume`), and reports how closely the quantized network matches the float weights.
 
-Before replacing the built-in network (`nets/wustite.nnue`), play the new one against it with `tools/match.py` and wait for the SPRT to finish:
+Compiling `train` with `-C target-cpu=native` speeds it up noticeably. Training on a million positions takes a few minutes; generating them is the slow part (roughly 400 positions/sec on two cores).
 
+If you ever want to regenerate the magic multipliers in `src/magic_numbers.rs`, run `cargo run --release --example find_magics`.
+
+## Python tools
+
+The scripts in `tools/` require Python 3 and [python-chess](https://github.com/niklasf/python-chess).
+
+`tools/make_openings.py` creates a balanced opening book by playing 6 or 8 random plies, deduplicating positions, and keeping ones that evaluate within ±100 cp at depth 7:
+
+```sh
+python3 tools/make_openings.py target/release/wustite tools/openings.txt 200
 ```
+
+`tools/match.py` runs paired engine-vs-engine matches (each opening played from both colors) and stops early once SPRT accepts H0 or H1:
+
+```sh
 python3 tools/match.py --bin target/release/wustite --openings tools/openings.txt --movetime 60 \
     --a "evalfile=net.nnue" --b "evalfile=nets/wustite.nnue" --games 400
 ```
 
-`tools/match.py` needs Python with [python-chess](https://github.com/niklasf/python-chess) installed.
+Pass `--bin-b <path>` to pit two different binaries against each other, or `--no-sprt` to play out all `--games`. Run `python3 tools/match.py --help` to see every flag.
 
-## Tests
+## Tests and docs
 
-```
+```sh
 cargo test --release
+cargo doc --no-deps --open
 ```
 
-Move generation is checked with perft on the standard positions and on several hundred random positions compared against python-chess. The network code is checked by comparing every incremental update with a full recomputation, and SIMD results with the scalar code. The examples in the documentation are run as tests too. Search changes are only kept after an SPRT match against a build without them.
+The tests check standard and random perft positions (cross-checked against python-chess), board invariants across move trees, incremental vs. full-refresh NNUE updates, SIMD vs. scalar parity, forced mates, and the UCI loop. Doc examples run as tests too.
 
-## Acknowledgements
+## Credits
 
-- [Chess Programming Wiki](https://www.chessprogramming.org/), for most of what I know about writing an engine
-- [PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) by Ronald Friederich, whose tables are the classical evaluation
-- [python-chess](https://github.com/niklasf/python-chess), used for cross-checking move generation and for running matches
-- [Stockfish](https://github.com/official-stockfish/Stockfish) and the other open source engines whose techniques are written up in public
-- [shieldcn](https://shieldcn.dev), for the badges
-- [cargo-dist](https://github.com/axodotdev/cargo-dist), for the release builds
+- [Chess Programming Wiki](https://www.chessprogramming.org/) for almost everything behind the engine
+- Ronald Friederich's [PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) tables for the classical eval
+- [python-chess](https://github.com/niklasf/python-chess) for cross-checking move generation and running matches
+- [Stockfish](https://github.com/official-stockfish/Stockfish) and other open-source engines whose ideas are documented in public
+- [shieldcn](https://shieldcn.dev) for the README badges
+- [cargo-dist](https://github.com/axodotdev/cargo-dist) for release builds
 
 ## License
 

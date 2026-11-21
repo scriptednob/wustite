@@ -1,3 +1,14 @@
+//! Brute-force search for rook and bishop magic bitboard multipliers.
+//!
+//! Generates sparse 64-bit candidates per square, checks that the top byte of
+//! `mask * magic` has enough bits set, and verifies that every blocker subset
+//! hashes without a destructive collision. Prints ready-to-paste Rust arrays
+//! for `src/magic_numbers.rs`.
+//!
+//! ```text
+//! cargo run --release --example find_magics > magics.txt
+//! ```
+
 const ROOK_DIRS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
 
@@ -5,6 +16,7 @@ fn on_board(file: i8, rank: i8) -> bool {
     (0..8).contains(&file) && (0..8).contains(&rank)
 }
 
+/// Reference ray walk used as the ground truth when checking candidate magics.
 fn ray_attacks(sq: usize, occ: u64, dirs: &[(i8, i8)]) -> u64 {
     let mut out = 0u64;
     for &(dx, dy) in dirs {
@@ -23,6 +35,7 @@ fn ray_attacks(sq: usize, occ: u64, dirs: &[(i8, i8)]) -> u64 {
     out
 }
 
+/// Relevant blocker mask for `sq`, omitting board edge squares.
 fn slider_mask(sq: usize, dirs: &[(i8, i8)]) -> u64 {
     let mut out = 0u64;
     for &(dx, dy) in dirs {
@@ -37,6 +50,7 @@ fn slider_mask(sq: usize, dirs: &[(i8, i8)]) -> u64 {
     out
 }
 
+/// Software bit-deposit (`pdep`) to enumerate every subset of `mask`.
 fn pdep(mut src: u64, mut mask: u64) -> u64 {
     let mut out = 0u64;
     while mask != 0 {
@@ -50,6 +64,7 @@ fn pdep(mut src: u64, mut mask: u64) -> u64 {
     out
 }
 
+/// XorShift64* RNG with a sparse-bit helper (ANDing three draws yields good magic candidates).
 struct Rng(u64);
 
 impl Rng {
@@ -65,6 +80,7 @@ impl Rng {
     }
 }
 
+/// Search until a valid magic multiplier is found for `sq`.
 fn find_magic(sq: usize, dirs: &[(i8, i8)], rng: &mut Rng) -> u64 {
     let mask = slider_mask(sq, dirs);
     let bits = mask.count_ones();
@@ -100,6 +116,7 @@ fn find_magic(sq: usize, dirs: &[(i8, i8)], rng: &mut Rng) -> u64 {
     }
 }
 
+/// Format a 64-entry multiplier table as a Rust `pub const` array.
 fn print_table(name: &str, magics: &[u64]) {
     println!("pub const {name}: [u64; 64] = [");
     for row in magics.chunks(2) {

@@ -1,3 +1,8 @@
+//! Board consistency, staged movegen parity, hashing, and FEN validation tests.
+//!
+//! Walks 3-ply move trees across the perft suite and random positions, verifying
+//! `Position::is_consistent`, king safety, and `GEN_TACTICAL + GEN_QUIET == GEN_ALL`.
+
 use wustite::movegen::{GEN_ALL, GEN_QUIET, GEN_TACTICAL, MoveList, generate, parse_move};
 use wustite::perft::SUITE;
 use wustite::{Move, Position};

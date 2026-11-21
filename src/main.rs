@@ -1,3 +1,8 @@
+//! Entry point for the `wustite` executable.
+//!
+//! Starts the UCI loop when launched with no arguments, or dispatches to one of
+//! the CLI subcommands (`bench`, `perft`, `divide`, `suite`).
+
 use std::env;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -8,6 +13,7 @@ use wustite::perft::{SUITE, divide, perft};
 use wustite::search::Params;
 use wustite::uci;
 
+/// Print CLI usage to stderr and exit with status 2.
 fn usage() -> ExitCode {
     eprintln!("usage:");
     eprintln!("  wustite                       start the UCI engine");
@@ -18,6 +24,7 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Run the fixed-depth benchmark (defaults to depth 12).
 fn run_bench(args: &[String]) -> ExitCode {
     let depth = args.first().and_then(|d| d.parse().ok()).unwrap_or(12);
     let report = bench::run(depth, Params::default(), true);
@@ -28,6 +35,7 @@ fn run_bench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Parse trailing CLI arguments as a FEN, or default to the starting position.
 fn position_from_args(args: &[String]) -> Result<Position, String> {
     if args.is_empty() {
         Ok(Position::startpos())
@@ -36,6 +44,7 @@ fn position_from_args(args: &[String]) -> Result<Position, String> {
     }
 }
 
+/// Compute nodes per second, returning 0 if elapsed time is zero.
 fn nodes_per_second(nodes: u64, seconds: f64) -> u64 {
     if seconds > 0.0 {
         (nodes as f64 / seconds) as u64
@@ -44,6 +53,7 @@ fn nodes_per_second(nodes: u64, seconds: f64) -> u64 {
     }
 }
 
+/// Run `perft` or `divide` from the command line and print totals and speed.
 fn run_perft(args: &[String], show_divide: bool) -> ExitCode {
     let Some(depth) = args.first().and_then(|d| d.parse::<u32>().ok()) else {
         return usage();
@@ -75,6 +85,7 @@ fn run_perft(args: &[String], show_divide: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Check every built-in position in [`SUITE`] up to `max-depth` (default 5).
 fn run_suite(args: &[String]) -> ExitCode {
     let max_depth = args
         .first()

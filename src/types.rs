@@ -1,39 +1,25 @@
-//! Core vocabulary shared by every other module: colours, piece kinds, pieces,
-//! squares and the packed 16-bit [`Move`].
+//! Core board types shared across the crate: [`Color`], [`PieceType`],
+//! [`Piece`], [`Square`], and the 16-bit [`Move`].
 //!
-//! Everything here is `Copy`, small, and cheap to pass by value. The types are
-//! thin wrappers over integers so that they can be used as array indices without
-//! any conversion cost, and most accessors are `const fn` so that lookup tables
-//! can be built at compile time.
+//! Everything here is `Copy`, small, and backed by plain integers so indexing
+//! arrays has zero overhead. Most accessors are `const fn` so lookup tables can
+//! be built at compile time.
 //!
-//! # Index conventions
+//! # Index layout
 //!
-//! | Type | Range | Layout |
+//! | Type | Range | Convention |
 //! | --- | --- | --- |
 //! | [`Color`] | `0..2` | `White = 0`, `Black = 1` |
 //! | [`PieceType`] | `0..6` | pawn, knight, bishop, rook, queen, king |
-//! | [`Piece`] | `0..12` | all six white pieces, then all six black pieces |
-//! | [`Square`] | `0..64` | `index = rank * 8 + file`, so a1 = 0, h1 = 7, a8 = 56, h8 = 63 |
+//! | [`Piece`] | `0..12` | white pieces (`0..6`), then black pieces (`6..12`) |
+//! | [`Square`] | `0..64` | `rank * 8 + file` (`a1 = 0`, `h1 = 7`, `a8 = 56`, `h8 = 63`) |
 //!
-//! # Move encoding
+//! # Move bit layout
 //!
-//! A [`Move`] is a single `u16`:
-//!
-//! ```text
-//!  15 14 13 12 | 11 10 9 8 7 6 | 5 4 3 2 1 0
-//!    flags     |   to square   | from square
-//! ```
-//!
-//! The four flag bits follow the common "from-to plus 4-bit flags" scheme. Bit 2
-//! (value 4) means *capture* and bit 3 (value 8) means *promotion*, which makes
-//! the most frequent questions ("is this a capture?", "is this a promotion?")
-//! a single mask test. See the [`flag`] module for the full table.
-//!
-//! The all-zero move (a1 to a1, quiet) is reserved as [`Move::NONE`]. No legal
-//! move can have identical origin and destination squares, so the encoding is
-//! unambiguous.
-//!
-//! # Examples
+//! A [`Move`] fits in one `u16`: bits `0..6` hold the origin square, bits
+//! `6..12` hold the destination square, and bits `12..16` hold the [`flag`]
+//! bits (bit 2 = capture, bit 3 = promotion). All zeros (`a1a1`, quiet) is
+//! reserved for [`Move::NONE`].
 //!
 //! ```
 //! use wustite::{Color, Move, Piece, PieceType, Square};
@@ -53,10 +39,10 @@ use core::fmt;
 
 use crate::bitboard::Bitboard;
 
-/// The two sides of a chess game.
+/// Side to move or piece color.
 ///
-/// `Color` converts to an array index with [`Color::idx`], and `!color` (or
-/// [`Color::flip`]) gives the opponent.
+/// Use [`Color::idx`] to index 2-element arrays and `!color` (or
+/// [`Color::flip`]) to get the opponent.
 ///
 /// ```
 /// use wustite::Color;
@@ -68,23 +54,23 @@ use crate::bitboard::Bitboard;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Color {
-    /// The side that moves first. Index `0`.
+    /// White (`0`).
     White = 0,
-    /// The side that moves second. Index `1`.
+    /// Black (`1`).
     Black = 1,
 }
 
 impl Color {
-    /// Both colours in index order, for `for color in Color::ALL` loops.
+    /// Both colors in index order (`[White, Black]`).
     pub const ALL: [Color; 2] = [Color::White, Color::Black];
 
-    /// The colour as an array index: `0` for white, `1` for black.
+    /// Array index (`0` for white, `1` for black).
     #[inline(always)]
     pub const fn idx(self) -> usize {
         self as usize
     }
 
-    /// The opposite colour. Also available through the `!` operator.
+    /// Return the opposite side (same as `!self`).
     #[inline(always)]
     pub const fn flip(self) -> Color {
         match self {
@@ -103,12 +89,11 @@ impl core::ops::Not for Color {
     }
 }
 
-/// The six kinds of chess piece, ignoring colour.
+/// Piece kind without color (`0..6`, pawn through king).
 ///
-/// The order (pawn, knight, bishop, rook, queen, king) is relied on throughout
-/// the engine: per-type bitboards in [`crate::board::Position`], the piece-value
-/// tables in [`crate::see`] and [`crate::eval`], and the NNUE feature layout in
-/// [`crate::nnue`] are all indexed by [`PieceType::idx`].
+/// Bitboard arrays in [`crate::board::Position`], value tables in
+/// [`crate::eval`] and [`crate::see`], and NNUE feature offsets in
+/// [`crate::nnue`] all rely on this exact ordering.
 ///
 /// ```
 /// use wustite::PieceType;
@@ -120,17 +105,17 @@ impl core::ops::Not for Color {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 #[repr(u8)]
 pub enum PieceType {
-    /// Pawn. Index `0`.
+    /// Pawn (`0`).
     Pawn = 0,
-    /// Knight. Index `1`.
+    /// Knight (`1`).
     Knight = 1,
-    /// Bishop. Index `2`.
+    /// Bishop (`2`).
     Bishop = 2,
-    /// Rook. Index `3`.
+    /// Rook (`3`).
     Rook = 3,
-    /// Queen. Index `4`.
+    /// Queen (`4`).
     Queen = 4,
-    /// King. Index `5`.
+    /// King (`5`).
     King = 5,
 }
 
@@ -145,15 +130,13 @@ impl PieceType {
         PieceType::King,
     ];
 
-    /// The piece type as an array index in `0..6`.
+    /// Array index in `0..6`.
     #[inline(always)]
     pub const fn idx(self) -> usize {
         self as usize
     }
 
-    /// The piece type with index `i`.
-    ///
-    /// # Panics
+    /// Convert an index in `0..6` back to a [`PieceType`].
     ///
     /// Panics if `i >= 6`.
     #[inline(always)]
@@ -162,16 +145,10 @@ impl PieceType {
     }
 }
 
-/// A coloured piece: one of twelve values.
+/// Colored piece (`0..12`): all white pieces (`0..6`), then all black pieces (`6..12`).
 ///
-/// The layout is "all white pieces, then all black pieces", each group in
-/// [`PieceType`] order, so `index = color * 6 + piece_type`. [`Piece::new`],
-/// [`Piece::color`] and [`Piece::piece_type`] convert between the combined and
-/// split representations.
-///
-/// The mailbox inside [`crate::board::Position`] stores `Option<Piece>` per
-/// square, and the NNUE feature index is derived from the piece's colour relative
-/// to the viewing side.
+/// Index is `color * 6 + piece_type`. Stored directly in the mailbox of
+/// [`crate::board::Position`].
 ///
 /// ```
 /// use wustite::{Color, Piece, PieceType};
@@ -185,34 +162,34 @@ impl PieceType {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Piece {
-    /// White pawn. Index `0`.
+    /// White pawn (`0`).
     WhitePawn = 0,
-    /// White knight. Index `1`.
+    /// White knight (`1`).
     WhiteKnight,
-    /// White bishop. Index `2`.
+    /// White bishop (`2`).
     WhiteBishop,
-    /// White rook. Index `3`.
+    /// White rook (`3`).
     WhiteRook,
-    /// White queen. Index `4`.
+    /// White queen (`4`).
     WhiteQueen,
-    /// White king. Index `5`.
+    /// White king (`5`).
     WhiteKing,
-    /// Black pawn. Index `6`.
+    /// Black pawn (`6`).
     BlackPawn,
-    /// Black knight. Index `7`.
+    /// Black knight (`7`).
     BlackKnight,
-    /// Black bishop. Index `8`.
+    /// Black bishop (`8`).
     BlackBishop,
-    /// Black rook. Index `9`.
+    /// Black rook (`9`).
     BlackRook,
-    /// Black queen. Index `10`.
+    /// Black queen (`10`).
     BlackQueen,
-    /// Black king. Index `11`.
+    /// Black king (`11`).
     BlackKing,
 }
 
 impl Piece {
-    /// All twelve pieces in index order.
+    /// All twelve colored pieces in index order.
     pub const ALL: [Piece; 12] = [
         Piece::WhitePawn,
         Piece::WhiteKnight,
@@ -230,7 +207,7 @@ impl Piece {
 
     const CHARS: [char; 12] = ['P', 'N', 'B', 'R', 'Q', 'K', 'p', 'n', 'b', 'r', 'q', 'k'];
 
-    /// Combines a colour and a piece type into a [`Piece`].
+    /// Combine a color and piece type into a [`Piece`].
     ///
     /// ```
     /// use wustite::{Color, Piece, PieceType};
@@ -242,13 +219,13 @@ impl Piece {
         Self::ALL[color.idx() * 6 + piece_type.idx()]
     }
 
-    /// The piece as an array index in `0..12`.
+    /// Array index in `0..12`.
     #[inline(always)]
     pub const fn idx(self) -> usize {
         self as usize
     }
 
-    /// The side the piece belongs to.
+    /// Side this piece belongs to.
     #[inline(always)]
     pub const fn color(self) -> Color {
         if (self as u8) < 6 {
@@ -258,18 +235,18 @@ impl Piece {
         }
     }
 
-    /// The kind of piece, with colour discarded.
+    /// Piece type without color.
     #[inline(always)]
     pub const fn piece_type(self) -> PieceType {
         PieceType::ALL[self.idx() % 6]
     }
 
-    /// The FEN letter: uppercase for white (`PNBRQK`), lowercase for black (`pnbrqk`).
+    /// FEN character (`PNBRQK` for white, `pnbrqk` for black).
     pub fn to_char(self) -> char {
         Self::CHARS[self.idx()]
     }
 
-    /// Parses a FEN piece letter, returning `None` for any other character.
+    /// Parse a FEN piece letter, or return `None` for anything else.
     ///
     /// ```
     /// use wustite::Piece;
@@ -285,17 +262,11 @@ impl Piece {
     }
 }
 
-/// A board square, stored as an index in `0..64` with `index = rank * 8 + file`.
+/// Board square in `0..64`, laid out as `rank * 8 + file` (`a1 = 0`, `h8 = 63`).
 ///
-/// Square `0` is a1, square `7` is h1, square `56` is a8 and square `63` is h8.
-/// Files and ranks are both zero-based, so file `0` is the a-file and rank `0` is
-/// the first rank. This "little-endian rank-file" mapping means that moving one
-/// rank up is `+8`, one file right is `+1`, and flipping a square vertically is
-/// `index ^ 56`, which both [`crate::eval`] and [`crate::nnue`] use to view the
-/// board from black's side.
-///
-/// All 64 squares are available as associated constants, `Square::A1` through
-/// `Square::H8`.
+/// With this layout, stepping north is `+8`, stepping east is `+1`, and
+/// flipping a square vertically for black's perspective is just `idx ^ 56`.
+/// Named constants `Square::A1` through `Square::H8` are provided below.
 ///
 /// ```
 /// use wustite::Square;
@@ -312,42 +283,40 @@ impl Piece {
 pub struct Square(pub u8);
 
 impl Square {
-    /// The number of squares on the board.
+    /// Total squares on a chessboard.
     pub const COUNT: usize = 64;
 
-    /// The square at the given zero-based file and rank.
-    ///
-    /// The arguments are not range-checked; `file` and `rank` must both be below 8.
+    /// Build a square from zero-based `file` (`0..8`) and `rank` (`0..8`). Caller ensures both are in range.
     #[inline(always)]
     pub const fn new(file: u8, rank: u8) -> Square {
         Square(rank * 8 + file)
     }
 
-    /// The square with index `i`. The index must be below 64.
+    /// Wrap a raw square index (`0..64`) without range checking.
     #[inline(always)]
     pub const fn from_idx(i: usize) -> Square {
         Square(i as u8)
     }
 
-    /// The square as an array index in `0..64`.
+    /// Array index in `0..64`.
     #[inline(always)]
     pub const fn idx(self) -> usize {
         self.0 as usize
     }
 
-    /// The zero-based file: `0` for the a-file up to `7` for the h-file.
+    /// Zero-based file (`0` = a-file, `7` = h-file).
     #[inline(always)]
     pub const fn file(self) -> u8 {
         self.0 & 7
     }
 
-    /// The zero-based rank: `0` for the first rank up to `7` for the eighth.
+    /// Zero-based rank (`0` = rank 1, `7` = rank 8).
     #[inline(always)]
     pub const fn rank(self) -> u8 {
         self.0 >> 3
     }
 
-    /// A [`Bitboard`] with only this square set.
+    /// Single-bit [`Bitboard`] with only this square set.
     ///
     /// ```
     /// use wustite::Square;
@@ -360,17 +329,13 @@ impl Square {
         Bitboard(1u64 << self.0)
     }
 
-    /// The square `delta` indices away, for example `+8` for one rank up.
-    ///
-    /// The result is not range-checked. Callers use it only where the destination is
-    /// known to be on the board, such as the square behind an en passant target.
+    /// Shift this square by `delta` indices (e.g. `+8` for one rank up). Caller guarantees the target stays on the board.
     #[inline(always)]
     pub const fn offset(self, delta: i8) -> Square {
         Square((self.0 as i8 + delta) as u8)
     }
 
-    /// Parses algebraic notation such as `"e4"`. Returns `None` unless the text is
-    /// exactly one file letter `a`-`h` followed by one rank digit `1`-`8`.
+    /// Parse algebraic square notation like `"e4"`, or return `None` if malformed.
     pub fn parse(text: &str) -> Option<Square> {
         let bytes = text.as_bytes();
         if bytes.len() != 2 {
@@ -398,187 +363,180 @@ impl fmt::Display for Square {
 }
 
 impl Square {
-    /// The square a1, index 0.
+    /// Square `a1`.
     pub const A1: Square = Square(0);
-    /// The square b1, index 1.
+    /// Square `b1`.
     pub const B1: Square = Square(1);
-    /// The square c1, index 2.
+    /// Square `c1`.
     pub const C1: Square = Square(2);
-    /// The square d1, index 3.
+    /// Square `d1`.
     pub const D1: Square = Square(3);
-    /// The square e1, index 4.
+    /// Square `e1`.
     pub const E1: Square = Square(4);
-    /// The square f1, index 5.
+    /// Square `f1`.
     pub const F1: Square = Square(5);
-    /// The square g1, index 6.
+    /// Square `g1`.
     pub const G1: Square = Square(6);
-    /// The square h1, index 7.
+    /// Square `h1`.
     pub const H1: Square = Square(7);
-    /// The square a2, index 8.
+    /// Square `a2`.
     pub const A2: Square = Square(8);
-    /// The square b2, index 9.
+    /// Square `b2`.
     pub const B2: Square = Square(9);
-    /// The square c2, index 10.
+    /// Square `c2`.
     pub const C2: Square = Square(10);
-    /// The square d2, index 11.
+    /// Square `d2`.
     pub const D2: Square = Square(11);
-    /// The square e2, index 12.
+    /// Square `e2`.
     pub const E2: Square = Square(12);
-    /// The square f2, index 13.
+    /// Square `f2`.
     pub const F2: Square = Square(13);
-    /// The square g2, index 14.
+    /// Square `g2`.
     pub const G2: Square = Square(14);
-    /// The square h2, index 15.
+    /// Square `h2`.
     pub const H2: Square = Square(15);
-    /// The square a3, index 16.
+    /// Square `a3`.
     pub const A3: Square = Square(16);
-    /// The square b3, index 17.
+    /// Square `b3`.
     pub const B3: Square = Square(17);
-    /// The square c3, index 18.
+    /// Square `c3`.
     pub const C3: Square = Square(18);
-    /// The square d3, index 19.
+    /// Square `d3`.
     pub const D3: Square = Square(19);
-    /// The square e3, index 20.
+    /// Square `e3`.
     pub const E3: Square = Square(20);
-    /// The square f3, index 21.
+    /// Square `f3`.
     pub const F3: Square = Square(21);
-    /// The square g3, index 22.
+    /// Square `g3`.
     pub const G3: Square = Square(22);
-    /// The square h3, index 23.
+    /// Square `h3`.
     pub const H3: Square = Square(23);
-    /// The square a4, index 24.
+    /// Square `a4`.
     pub const A4: Square = Square(24);
-    /// The square b4, index 25.
+    /// Square `b4`.
     pub const B4: Square = Square(25);
-    /// The square c4, index 26.
+    /// Square `c4`.
     pub const C4: Square = Square(26);
-    /// The square d4, index 27.
+    /// Square `d4`.
     pub const D4: Square = Square(27);
-    /// The square e4, index 28.
+    /// Square `e4`.
     pub const E4: Square = Square(28);
-    /// The square f4, index 29.
+    /// Square `f4`.
     pub const F4: Square = Square(29);
-    /// The square g4, index 30.
+    /// Square `g4`.
     pub const G4: Square = Square(30);
-    /// The square h4, index 31.
+    /// Square `h4`.
     pub const H4: Square = Square(31);
-    /// The square a5, index 32.
+    /// Square `a5`.
     pub const A5: Square = Square(32);
-    /// The square b5, index 33.
+    /// Square `b5`.
     pub const B5: Square = Square(33);
-    /// The square c5, index 34.
+    /// Square `c5`.
     pub const C5: Square = Square(34);
-    /// The square d5, index 35.
+    /// Square `d5`.
     pub const D5: Square = Square(35);
-    /// The square e5, index 36.
+    /// Square `e5`.
     pub const E5: Square = Square(36);
-    /// The square f5, index 37.
+    /// Square `f5`.
     pub const F5: Square = Square(37);
-    /// The square g5, index 38.
+    /// Square `g5`.
     pub const G5: Square = Square(38);
-    /// The square h5, index 39.
+    /// Square `h5`.
     pub const H5: Square = Square(39);
-    /// The square a6, index 40.
+    /// Square `a6`.
     pub const A6: Square = Square(40);
-    /// The square b6, index 41.
+    /// Square `b6`.
     pub const B6: Square = Square(41);
-    /// The square c6, index 42.
+    /// Square `c6`.
     pub const C6: Square = Square(42);
-    /// The square d6, index 43.
+    /// Square `d6`.
     pub const D6: Square = Square(43);
-    /// The square e6, index 44.
+    /// Square `e6`.
     pub const E6: Square = Square(44);
-    /// The square f6, index 45.
+    /// Square `f6`.
     pub const F6: Square = Square(45);
-    /// The square g6, index 46.
+    /// Square `g6`.
     pub const G6: Square = Square(46);
-    /// The square h6, index 47.
+    /// Square `h6`.
     pub const H6: Square = Square(47);
-    /// The square a7, index 48.
+    /// Square `a7`.
     pub const A7: Square = Square(48);
-    /// The square b7, index 49.
+    /// Square `b7`.
     pub const B7: Square = Square(49);
-    /// The square c7, index 50.
+    /// Square `c7`.
     pub const C7: Square = Square(50);
-    /// The square d7, index 51.
+    /// Square `d7`.
     pub const D7: Square = Square(51);
-    /// The square e7, index 52.
+    /// Square `e7`.
     pub const E7: Square = Square(52);
-    /// The square f7, index 53.
+    /// Square `f7`.
     pub const F7: Square = Square(53);
-    /// The square g7, index 54.
+    /// Square `g7`.
     pub const G7: Square = Square(54);
-    /// The square h7, index 55.
+    /// Square `h7`.
     pub const H7: Square = Square(55);
-    /// The square a8, index 56.
+    /// Square `a8`.
     pub const A8: Square = Square(56);
-    /// The square b8, index 57.
+    /// Square `b8`.
     pub const B8: Square = Square(57);
-    /// The square c8, index 58.
+    /// Square `c8`.
     pub const C8: Square = Square(58);
-    /// The square d8, index 59.
+    /// Square `d8`.
     pub const D8: Square = Square(59);
-    /// The square e8, index 60.
+    /// Square `e8`.
     pub const E8: Square = Square(60);
-    /// The square f8, index 61.
+    /// Square `f8`.
     pub const F8: Square = Square(61);
-    /// The square g8, index 62.
+    /// Square `g8`.
     pub const G8: Square = Square(62);
-    /// The square h8, index 63.
+    /// Square `h8`.
     pub const H8: Square = Square(63);
 }
 
-/// Move flag values stored in the top four bits of a [`Move`].
+/// 4-bit move flags stored in bits `12..16` of a [`Move`].
 ///
 /// | Value | Constant | Meaning |
 /// | --- | --- | --- |
-/// | 0 | [`flag::QUIET`] | Non-capturing, non-special move |
-/// | 1 | [`flag::DOUBLE_PUSH`] | Pawn advancing two squares |
-/// | 2 | [`flag::KING_CASTLE`] | Castling short (king to the g-file) |
-/// | 3 | [`flag::QUEEN_CASTLE`] | Castling long (king to the c-file) |
-/// | 4 | [`flag::CAPTURE`] | Ordinary capture |
+/// | 0 | [`flag::QUIET`] | Normal non-capture |
+/// | 1 | [`flag::DOUBLE_PUSH`] | Two-square pawn push |
+/// | 2 | [`flag::KING_CASTLE`] | Castling kingside |
+/// | 3 | [`flag::QUEEN_CASTLE`] | Castling queenside |
+/// | 4 | [`flag::CAPTURE`] | Regular capture |
 /// | 5 | [`flag::EN_PASSANT`] | En passant capture |
-/// | 8 | [`flag::PROMO_KNIGHT`] | Promotion to a knight |
-/// | 9 | [`flag::PROMO_BISHOP`] | Promotion to a bishop |
-/// | 10 | [`flag::PROMO_ROOK`] | Promotion to a rook |
-/// | 11 | [`flag::PROMO_QUEEN`] | Promotion to a queen |
-/// | 12 to 15 | promotion `\|` [`flag::PROMO_CAPTURE_BIT`] | Capturing promotion |
+/// | 8..11 | `PROMO_*` | Quiet promotion (knight, bishop, rook, queen) |
+/// | 12..15 | `PROMO_* \| PROMO_CAPTURE_BIT` | Capturing promotion |
 ///
-/// Bit 2 of the flags marks captures and bit 3 marks promotions, so
-/// `flags & 4 != 0` is "is a capture" and `flags & 8 != 0` is "is a promotion".
-/// The low two bits of a promotion flag select the piece
-/// (`0` knight, `1` bishop, `2` rook, `3` queen).
+/// Bit 2 (`4`) marks captures and bit 3 (`8`) marks promotions, so both checks
+/// are single bit tests. The bottom two bits of any promotion pick the piece.
 pub mod flag {
     /// Plain non-capturing move.
     pub const QUIET: u16 = 0;
-    /// Pawn double push. Sets the en passant square when an enemy pawn can use it.
+    /// Two-square pawn advance.
     pub const DOUBLE_PUSH: u16 = 1;
-    /// King-side castling. The move is encoded as the king moving two squares toward the h-file.
+    /// Kingside castling (encoded as the king moving two squares toward h).
     pub const KING_CASTLE: u16 = 2;
-    /// Queen-side castling. The move is encoded as the king moving two squares toward the a-file.
+    /// Queenside castling (encoded as the king moving two squares toward a).
     pub const QUEEN_CASTLE: u16 = 3;
-    /// Ordinary capture of the piece on the destination square.
+    /// Normal capture on the destination square.
     pub const CAPTURE: u16 = 4;
-    /// En passant capture. The captured pawn is not on the destination square.
+    /// En passant capture (captured pawn sits behind `to_sq`).
     pub const EN_PASSANT: u16 = 5;
-    /// Quiet promotion to a knight.
+    /// Quiet promotion to knight.
     pub const PROMO_KNIGHT: u16 = 8;
-    /// Quiet promotion to a bishop.
+    /// Quiet promotion to bishop.
     pub const PROMO_BISHOP: u16 = 9;
-    /// Quiet promotion to a rook.
+    /// Quiet promotion to rook.
     pub const PROMO_ROOK: u16 = 10;
-    /// Quiet promotion to a queen.
+    /// Quiet promotion to queen.
     pub const PROMO_QUEEN: u16 = 11;
-    /// OR this into a promotion flag to mark the promotion as a capture.
+    /// Bit OR'd onto a `PROMO_*` flag when the promotion is also a capture.
     pub const PROMO_CAPTURE_BIT: u16 = 4;
 }
 
-/// A chess move packed into 16 bits: origin square, destination square and flags.
+/// Chess move packed into a `u16` (`from`, `to`, and 4-bit [`flag`]).
 ///
-/// See the [module documentation](self) for the bit layout. A `Move` does not
-/// know which piece is moving; that is looked up on the board when the move is
-/// made. The textual form (`Display`) is long algebraic notation as used by UCI,
-/// for example `e2e4` or `e7e8q`.
+/// Doesn't store which piece moved—that's read from the board when playing the
+/// move. Formats via `Display` as UCI long algebraic (`e2e4`, `e7e8q`, `0000`).
 ///
 /// ```
 /// use wustite::Move;
@@ -597,82 +555,82 @@ pub mod flag {
 pub struct Move(u16);
 
 impl Move {
-    /// The null move, used as "no move" in tables and results. It prints as `0000`.
+    /// Empty/missing move sentinel (`0`), printed as `0000`.
     pub const NONE: Move = Move(0);
 
-    /// Packs an origin square, a destination square and a [`flag`] value into a move.
+    /// Pack `from`, `to`, and [`flag`] bits into a `Move`.
     #[inline(always)]
     pub const fn new(from: Square, to: Square, flags: u16) -> Move {
         Move(from.0 as u16 | ((to.0 as u16) << 6) | (flags << 12))
     }
 
-    /// The square the piece moves from.
+    /// Origin square.
     #[inline(always)]
     pub const fn from_sq(self) -> Square {
         Square((self.0 & 63) as u8)
     }
 
-    /// The square the piece moves to. For castling this is the king's destination.
+    /// Destination square (the king's target square for castling).
     #[inline(always)]
     pub const fn to_sq(self) -> Square {
         Square(((self.0 >> 6) & 63) as u8)
     }
 
-    /// The four flag bits as a value in `0..16`. Compare against the [`flag`] constants.
+    /// Top four flag bits (`0..16`); compare against constants in [`flag`].
     #[inline(always)]
     pub const fn flags(self) -> u16 {
         self.0 >> 12
     }
 
-    /// The raw 16-bit encoding, as stored in the transposition table.
+    /// Raw `u16` value, used when packing into the transposition table.
     #[inline(always)]
     pub const fn raw(self) -> u16 {
         self.0
     }
 
-    /// Rebuilds a move from [`Move::raw`]. Any `u16` is accepted; no legality is implied.
+    /// Wrap a raw `u16` back into a `Move` without checking legality.
     #[inline(always)]
     pub const fn from_raw(raw: u16) -> Move {
         Move(raw)
     }
 
-    /// Whether this is [`Move::NONE`].
+    /// `true` if this is [`Move::NONE`].
     #[inline(always)]
     pub const fn is_none(self) -> bool {
         self.0 == 0
     }
 
-    /// Whether the move captures a piece, including en passant and capturing promotions.
+    /// `true` for normal captures, en passant, and capturing promotions.
     #[inline(always)]
     pub const fn is_capture(self) -> bool {
         self.flags() & 4 != 0
     }
 
-    /// Whether the move promotes a pawn.
+    /// `true` for any pawn promotion (quiet or capturing).
     #[inline(always)]
     pub const fn is_promotion(self) -> bool {
         self.flags() & 8 != 0
     }
 
-    /// Whether the move is an en passant capture.
+    /// `true` for an en passant capture.
     #[inline(always)]
     pub const fn is_en_passant(self) -> bool {
         self.flags() == flag::EN_PASSANT
     }
 
-    /// Whether the move is a king-side or queen-side castle.
+    /// `true` for kingside or queenside castling.
     #[inline(always)]
     pub const fn is_castle(self) -> bool {
         self.flags() == flag::KING_CASTLE || self.flags() == flag::QUEEN_CASTLE
     }
 
-    /// Whether the move is a two-square pawn advance.
+    /// `true` for a two-square pawn advance.
     #[inline(always)]
     pub const fn is_double_push(self) -> bool {
         self.flags() == flag::DOUBLE_PUSH
     }
 
-    /// The piece a pawn promotes to, or `None` when the move is not a promotion.
+    /// Promoted piece type, or `None` if this move isn't a promotion.
     #[inline(always)]
     pub const fn promotion_piece(self) -> Option<PieceType> {
         if self.is_promotion() {

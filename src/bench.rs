@@ -1,21 +1,15 @@
-//! A fixed-depth search benchmark.
+//! Fixed-depth search benchmark.
 //!
-//! [`run`] searches a fixed list of positions ([`BENCH_FENS`]) to a fixed depth
-//! with a fresh transposition table and one thread, and reports the total number
-//! of nodes and the elapsed time. Two properties make this useful:
+//! [`run`] searches [`BENCH_FENS`] to a fixed depth on one thread with a clean
+//! hash table and reports total nodes and wall time.
 //!
-//! * The **node count is deterministic** for a given build and depth, because the
-//!   search is single-threaded and depth-limited. Any change in the count after an
-//!   edit means the *search behaviour* changed, which is exactly what a
-//!   "functional" refactor must not do. Quote the node count in commit messages
-//!   when a change is meant to be behaviour-neutral.
-//! * The **nodes-per-second** figure measures raw speed: move generation,
-//!   make-move, evaluation and table access.
+//! Because it's single-threaded and depth-limited, the total node count is
+//! completely deterministic for a given build. If a refactor isn't supposed to
+//! change search behavior and the bench node count shifts, something broke. It's
+//! also a quick way to check raw NPS.
 //!
-//! Run it from the command line with `wustite bench [depth]` (default depth 12),
-//! or from a UCI session with `bench [depth]` (default 10).
-//!
-//! # Examples
+//! Run from the CLI with `wustite bench [depth]` (default 12), or inside UCI
+//! with `bench [depth]` (default 10).
 //!
 //! ```no_run
 //! use wustite::bench;
@@ -31,9 +25,7 @@ use crate::board::Position;
 use crate::search::{Heuristics, Params, SearchLimits, SharedState, think};
 use crate::tt::TranspositionTable;
 
-/// The benchmark positions: the starting position, a dozen tactical and
-/// positional middlegames, and two endings, so that the benchmark exercises both
-/// the busy and the quiet parts of the search.
+/// Mix of opening, middlegame, and endgame FENs searched by [`run`].
 pub const BENCH_FENS: &[&str] = &[
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 10",
@@ -51,22 +43,19 @@ pub const BENCH_FENS: &[&str] = &[
     "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1",
 ];
 
-/// The outcome of a [`run`].
+/// Totals returned by [`run`].
 pub struct BenchReport {
-    /// Total nodes searched over all positions.
+    /// Sum of searched nodes across all benchmark positions.
     pub nodes: u64,
-    /// Wall-clock time in seconds.
+    /// Elapsed wall-clock time in seconds.
     pub seconds: f64,
 }
 
-/// Searches every position in [`BENCH_FENS`] to `depth` plies and returns the
-/// totals.
+/// Search every position in [`BENCH_FENS`] to `depth` plies and return the totals.
 ///
-/// `params` selects which search features are enabled; pass
-/// [`Params::default`](crate::search::Params) for the shipping configuration.
-/// When `verbose` is set, one line per position (best move and node count) is
-/// printed. Each position is searched with an emptied transposition table and
-/// emptied history tables so that results do not depend on order.
+/// Clears the transposition table and history tables before each position so
+/// earlier positions don't affect later ones. Pass `verbose = true` to print
+/// each position's best move and node count as it finishes.
 pub fn run(depth: i32, params: Params, verbose: bool) -> BenchReport {
     let tt = TranspositionTable::new(16);
     let mut heuristics = vec![Heuristics::new()];

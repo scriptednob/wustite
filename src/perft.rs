@@ -1,21 +1,14 @@
-//! Perft: the correctness test for move generation.
+//! Perft move-generation checks and reference positions.
 //!
-//! *Perft* ("performance test") counts the leaf nodes of the legal-move tree to a
-//! fixed depth. Because the number of legal move sequences from a position is a
-//! precisely known quantity (published for many positions), any bug in move
-//! generation, make-move, castling rights or en passant handling shows up as a
-//! wrong count. It is the standard first test for any chess engine.
+//! Perft walks the legal move tree to a fixed depth and counts leaf nodes.
+//! Since exact counts are known for standard test positions, any bug in pins,
+//! en passant, castling rights, or `make_move` shows up right away as a wrong
+//! total.
 //!
-//! [`SUITE`] contains the standard reference positions with known counts, and
-//! [`perft`] and [`divide`] compute them. The same code backs the command-line
-//! `wustite perft`, `wustite divide` and `wustite suite`, and the UCI command
-//! `go perft N`.
-//!
-//! Move generation here is *bulk counted* at the last ply: when `depth == 1` the
-//! function returns the length of the move list without making any moves, which
-//! roughly doubles the speed.
-//!
-//! # Examples
+//! Leaf nodes at `depth == 1` are bulk-counted by returning `list.len()` without
+//! playing the moves, which roughly doubles speed. The CLI commands
+//! (`wustite perft`, `divide`, `suite`) and UCI `go perft` all call into this
+//! module.
 //!
 //! ```
 //! use wustite::Position;
@@ -28,9 +21,8 @@
 //! assert_eq!(perft(&pos, 4), 197_281);
 //! ```
 //!
-//! When a count disagrees with a reference, run [`divide`] on the position and
-//! compare per-move counts against another engine to find the offending move,
-//! then repeat one ply deeper on that move's child position.
+//! When a count is off, [`divide`] splits the total by root move so you can
+//! diff it against another engine and narrow down the exact failing move:
 //!
 //! ```
 //! use wustite::Position;
@@ -45,24 +37,20 @@ use crate::board::Position;
 use crate::movegen::{GEN_ALL, MoveList, generate};
 use crate::types::Move;
 
-/// One reference position with its known node counts.
+/// A named FEN paired with its expected perft node counts.
 pub struct PerftCase {
-    /// A short human-readable name, such as `"kiwipete"`.
+    /// Short label for the test case (e.g. `"kiwipete"`).
     pub name: &'static str,
-    /// The position in FEN.
+    /// Starting FEN for the test.
     pub fen: &'static str,
-    /// Pairs of `(depth, expected node count)`.
+    /// Expected `(depth, nodes)` pairs.
     pub results: &'static [(u32, u64)],
 }
 
-/// The reference perft positions.
+/// Standard perft suite from the Chess Programming Wiki.
 ///
-/// The set covers the starting position, "Kiwipete" (a position dense with
-/// tactics, castling and en passant possibilities), and the other standard
-/// edge-case positions from the Chess Programming Wiki, including promotions,
-/// discovered checks and en passant pins, and a colour-mirrored copy of one of
-/// them. Counts up to depth 6 are listed where they are fast enough to run in a
-/// test.
+/// Covers `startpos`, Kiwipete, tricky promotion/pin/en-passant positions, and
+/// a color-mirrored check.
 pub static SUITE: &[PerftCase] = &[
     PerftCase {
         name: "startpos",
@@ -133,10 +121,9 @@ pub static SUITE: &[PerftCase] = &[
     },
 ];
 
-/// Counts the leaf nodes of the legal-move tree rooted at `pos`, `depth` plies deep.
+/// Count leaf nodes `depth` plies below `pos`.
 ///
-/// `perft(pos, 0)` is `1` by definition. At depth 1 it returns the number of
-/// legal moves without playing them.
+/// Returns `1` at depth 0 and bulk-counts legal moves directly at depth 1.
 pub fn perft(pos: &Position, depth: u32) -> u64 {
     if depth == 0 {
         return 1;
@@ -153,12 +140,10 @@ pub fn perft(pos: &Position, depth: u32) -> u64 {
     nodes
 }
 
-/// Perft split by root move: for each legal move, the number of leaf nodes in
-/// its subtree at `depth - 1` plies below it.
+/// Run perft for each legal root move, sorted alphabetically by UCI string.
 ///
-/// The result is sorted by the move's text, which makes it directly comparable
-/// with the output of other engines' `divide` or `go perft`. The sum of the node
-/// counts equals `perft(pos, depth)`.
+/// Sorting makes the output easy to diff against Stockfish or another engine's
+/// `go perft`. Summing the counts matches `perft(pos, depth)`.
 pub fn divide(pos: &Position, depth: u32) -> Vec<(Move, u64)> {
     let mut list = MoveList::new();
     generate::<GEN_ALL>(pos, &mut list);

@@ -1,73 +1,40 @@
-//! The lockless shared transposition table.
+//! Lockless shared transposition table.
 //!
-//! A transposition table caches search results keyed by position hash, so a
-//! position reached by a different move order (a *transposition*) is not searched
-//! again, and so the best move found at a shallower depth can be tried first at
-//! the next iteration.
+//! Caches search results by Zobrist hash so transpositions don't get re-searched
+//! and the best move from shallower iterations gets tried first.
 //!
-//! # Thread safety without locks
+//! # Lockless concurrent access
 //!
-//! All search threads (Lazy SMP) share **one** table and read and write it
-//! concurrently with no mutex. This is sound because every slot is two
-//! `AtomicU64` words and an entry is validated on read:
+//! Lazy SMP threads read and write the same table concurrently using
+//! `Ordering::Relaxed` with no locks, relying on Robert Hyatt's XOR trick.
+//! Each 16-byte slot holds two `AtomicU64` words:
 //!
 //! ```text
-//! slot.data  = move | score | eval | depth | bound | age   (64 bits)
-//! slot.check = data XOR key
+//! slot.data  = move | score | eval | depth | bound | age
+//! slot.check = data ^ key
 //! ```
 //!
-//! A reader loads both words and accepts the entry only if
-//! `check ^ data == key`. If another thread was halfway through a write and the
-//! two words belong to different entries, the XOR will not reproduce the probing
-//! key (with overwhelming probability) and the probe simply reports a miss. A torn
-//! read costs one lost hit, never a wrong answer. All accesses use
-//! `Ordering::Relaxed`; no ordering between slots is needed.
+//! A probe loads both words and only accepts the slot when `check ^ data == key`.
+//! If a concurrent write tears the two words, the XOR won't match and the probe
+//! just treats it as a miss—never a corrupted score or illegal move.
 //!
-//! This is the same "XOR trick" popularised by Robert Hyatt's lockless hashing.
+//! # Layout and replacement
 //!
-//! # Memory layout
-//!
-//! * A **slot** is 16 bytes: two atomic words.
-//! * A **bucket** is four slots, 64 bytes, aligned to 64 so that it is exactly
-//!   one cache line. A probe touches one line.
-//! * The bucket for a key is chosen with a multiply-shift
-//!   (`(key * bucket_count) >> 64`), which maps uniformly onto any bucket count
-//!   without needing a power-of-two table size, so `Hash` can be any number of
-//!   megabytes.
-//! * [`TranspositionTable::prefetch`] issues a cache prefetch for a key's bucket.
-//!   The search calls it right after creating a child position, before doing
-//!   other work, to hide memory latency.
-//!
-//! # Entry contents
-//!
-//! Each entry holds the best move, the search score, the static evaluation, the
-//! depth searched, a [`Bound`] and a 6-bit age. Scores and evaluations are
-//! stored as `i16`; the engine's score range (`+-32000`) fits.
-//!
-//! # Replacement policy
+//! Four slots pack into a 64-byte, cache-line-aligned bucket. Buckets are
+//! indexed via multiply-shift (`(key * buckets) >> 64`), which spreads keys
+//! evenly without forcing power-of-two table sizes.
 //!
 //! On [`TranspositionTable::store`]:
+//! 1. Fill any empty slot in the bucket first.
+//! 2. If `key` is already in the bucket, overwrite it when the new entry is
+//!    exact, within 3 plies of the old depth, or from a newer search (keeping
+//!    the old best move if the new one is [`Move::NONE`]).
+//! 3. Otherwise evict the slot minimizing `depth - 8 * relative_age`.
 //!
-//! 1. An empty slot in the bucket is used first.
-//! 2. If the key is already present its slot is rewritten, but only when the new
-//!    result is exact, no more than 3 plies shallower than the old one, or the
-//!    old entry is from an earlier search. A stored best move is kept if the new result
-//!    has none.
-//! 3. Otherwise the victim is the slot with the lowest `depth - 8 * relative_age`,
-//!    so shallow and stale entries are evicted first, and entries from the current
-//!    search are protected.
-//!
-//! The *age* increments once per `go` ([`TranspositionTable::new_search`]), so
-//! nothing has to be cleared between moves.
-//!
-//! # Mate scores
-//!
-//! The table does not know about the ply at which it was probed, so mate scores
-//! are stored relative to the node and adjusted on the way in and out (see
-//! [`crate::search`]). Without that, a "mate in 3" found deep in one line would be
-//! reported as the wrong distance when reached by a transposition.
-//!
-//! # Examples
+//! Calling [`TranspositionTable::new_search`] bumps the 6-bit age between `go`
+//! commands so old entries naturally get evicted without clearing the table.
+//! Callers are responsible for converting mate scores to/from node-relative
+//! distance before storing or using them (see [`crate::search`]).
 //!
 //! ```
 //! use wustite::Move;
@@ -88,26 +55,22 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::types::Move;
 
-/// What a stored score means relative to the true value of the position.
-///
-/// Alpha-beta search rarely computes exact values. A node that fails high only
-/// proves a lower bound; one that fails low proves an upper bound; only a node
-/// whose value lands strictly inside the search window is exact.
+/// Meaning of a cached search score relative to the true value of the node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Bound {
-    /// No information. Also the value of an empty slot.
+    /// Empty slot / no bound.
     None = 0,
-    /// The true score is **at most** the stored score. The search failed low (no move improved alpha).
+    /// Fail-low: true score is at most `score`.
     Upper = 1,
-    /// The true score is **at least** the stored score. The search failed high (a move reached beta).
+    /// Fail-high: true score is at least `score`.
     Lower = 2,
-    /// The stored score is the true score. The value fell inside the alpha-beta window.
+    /// Exact score inside the `(alpha, beta)` window.
     Exact = 3,
 }
 
 impl Bound {
-    /// Decodes the two bound bits of a packed entry.
+    /// Decode the 2-bit bound tag from a packed word.
     #[inline(always)]
     fn from_bits(bits: u64) -> Bound {
         match bits & 3 {
@@ -119,28 +82,28 @@ impl Bound {
     }
 }
 
-/// A decoded transposition-table entry returned by [`TranspositionTable::probe`].
+/// Unpacked transposition-table entry returned by [`TranspositionTable::probe`].
 #[derive(Clone, Copy, Debug)]
 pub struct TtEntry {
-    /// The best or refutation move found, or [`Move::NONE`]. Searched first to improve move ordering.
+    /// Best or refutation move found, or [`Move::NONE`].
     pub mv: Move,
-    /// The search score. Mate scores are stored relative to the node and must be re-based by the caller.
+    /// Cached search score (mate scores are node-relative; callers re-base by ply).
     pub score: i32,
-    /// The static evaluation of the position, cached so it need not be recomputed. This can be reused even when the search score is not usable.
+    /// Cached static eval so we don't recompute it on revisiting the node.
     pub eval: i32,
-    /// The remaining depth the position was searched to. Quiescence results are stored with depth 0.
+    /// Remaining search depth (quiescence entries use `0`).
     pub depth: i32,
-    /// Whether [`TtEntry::score`] is exact or only a bound.
+    /// Whether `score` is exact, a lower bound, or an upper bound.
     pub bound: Bound,
 }
 
-/// One entry: the packed data word and the verification word `data ^ key`. See the [module documentation](crate::tt).
+/// Single lockless slot (`data` + `data ^ key` check word).
 struct Slot {
     check: AtomicU64,
     data: AtomicU64,
 }
 
-/// Four slots in one 64-byte cache line.
+/// Four slots packed into one 64-byte cache line.
 #[repr(align(64))]
 struct Bucket {
     slots: [Slot; 4],
@@ -171,16 +134,7 @@ impl Bucket {
     }
 }
 
-/// Packs an entry into 64 bits:
-///
-/// | Bits | Field |
-/// | --- | --- |
-/// | 0-15 | move |
-/// | 16-31 | score (`i16`) |
-/// | 32-47 | static eval (`i16`) |
-/// | 48-55 | depth (clamped to 0..=255) |
-/// | 56-57 | bound |
-/// | 58-63 | age (0..=63) |
+/// Pack an entry into 64 bits: move (0..16), score (16..32), eval (32..48), depth (48..56), bound (56..58), age (58..64).
 fn pack(mv: Move, score: i32, eval: i32, depth: i32, bound: Bound, age: u8) -> u64 {
     (mv.raw() as u64)
         | (((score as i16) as u16 as u64) << 16)
@@ -190,7 +144,7 @@ fn pack(mv: Move, score: i32, eval: i32, depth: i32, bound: Bound, age: u8) -> u
         | (((age & 63) as u64) << 58)
 }
 
-/// Decodes a packed entry, returning it together with its age.
+/// Unpack a 64-bit data word into `(TtEntry, age)`.
 fn unpack(data: u64) -> (TtEntry, u8) {
     let entry = TtEntry {
         mv: Move::from_raw(data as u16),
@@ -202,11 +156,7 @@ fn unpack(data: u64) -> (TtEntry, u8) {
     (entry, ((data >> 58) & 63) as u8)
 }
 
-/// A fixed-size, lockless, thread-shared transposition table.
-///
-/// All methods take `&self`: the table is designed to be shared by reference
-/// between search threads (the engine wraps it in an `Arc` so the UCI thread can
-/// also resize and clear it).
+/// Fixed-size, lockless transposition table safe to share across threads via `&self`.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -237,11 +187,7 @@ pub struct TranspositionTable {
 }
 
 impl TranspositionTable {
-    /// Allocates a table of about `megabytes` MiB, rounded down to whole 64-byte
-    /// buckets. At least one bucket is always allocated, so `new(0)` behaves like
-    /// `new(1)`.
-    ///
-    /// The memory is zeroed, which marks every slot empty.
+    /// Allocate a zeroed table of roughly `megabytes` MiB (clamped to at least 1 MiB).
     pub fn new(megabytes: usize) -> TranspositionTable {
         let count = (megabytes.max(1) * 1024 * 1024 / core::mem::size_of::<Bucket>()).max(1);
         let mut buckets = Vec::with_capacity(count);
@@ -252,7 +198,7 @@ impl TranspositionTable {
         }
     }
 
-    /// Empties the whole table and resets the age. Not safe to call meaningfully during a search; the UCI layer stops the search first.
+    /// Zero every slot and reset the search age. Call only when no search is running.
     pub fn clear(&self) {
         for bucket in &self.buckets {
             for slot in &bucket.slots {
@@ -263,19 +209,19 @@ impl TranspositionTable {
         self.age.store(0, Ordering::Relaxed);
     }
 
-    /// Advances the age by one (modulo 64). Call once at the start of every search so that entries from earlier searches become eviction candidates instead of being cleared.
+    /// Increment the 6-bit generation counter once per `go` so stale entries age out.
     pub fn new_search(&self) {
         let next = (self.age.load(Ordering::Relaxed) + 1) & 63;
         self.age.store(next, Ordering::Relaxed);
     }
 
-    /// Maps a hash to a bucket index using multiply-shift, which is uniform for any bucket count.
+    /// Map a 64-bit hash onto `0..buckets.len()` via multiply-shift.
     #[inline(always)]
     fn index(&self, key: u64) -> usize {
         ((key as u128 * self.buckets.len() as u128) >> 64) as usize
     }
 
-    /// Hints the CPU to load the bucket for `key` into cache. A no-op on targets other than x86-64.
+    /// Issue an L1 prefetch hint for `key`'s bucket on x86-64 (no-op elsewhere).
     #[inline(always)]
     pub fn prefetch(&self, key: u64) {
         #[cfg(target_arch = "x86_64")]
@@ -292,9 +238,7 @@ impl TranspositionTable {
         let _ = key;
     }
 
-    /// Looks up `key`. Returns the entry if one with a valid verification word is
-    /// found in the key's bucket, and `None` otherwise (including for torn reads
-    /// caused by a concurrent write).
+    /// Look up `key` in its bucket, returning `None` on a miss or a torn concurrent read.
     #[inline(always)]
     pub fn probe(&self, key: u64) -> Option<TtEntry> {
         let bucket = &self.buckets[self.index(key)];
@@ -308,11 +252,7 @@ impl TranspositionTable {
         None
     }
 
-    /// Records a search result for `key`.
-    ///
-    /// `mv` may be [`Move::NONE`]; when overwriting an existing entry for the same
-    /// key the old move is then preserved. See the [module documentation](crate::tt)
-    /// for the replacement policy.
+    /// Insert or update an entry for `key`, preserving any existing move if `mv` is [`Move::NONE`].
     ///
     /// ```
     /// use wustite::Move;
@@ -359,9 +299,7 @@ impl TranspositionTable {
         slot.check.store(packed ^ key, Ordering::Relaxed);
     }
 
-    /// Estimates how full the table is in permille (0 to 1000), the value UCI
-    /// reports as `hashfull`. It samples the first 250 buckets and counts only slots
-    /// written during the current search (matching age).
+    /// Approximate fill rate in permille (`0..=1000`) for UCI `hashfull`, sampled over the first 250 buckets.
     pub fn hashfull(&self) -> usize {
         let age = self.age.load(Ordering::Relaxed);
         let sample = self.buckets.len().min(250);

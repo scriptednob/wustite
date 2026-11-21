@@ -1,52 +1,29 @@
-//! The chess position and everything needed to move through the game tree.
+//! Board state ([`Position`]), copy-make updates, and FEN parsing.
 //!
-//! [`Position`] is the central data structure of the engine. It holds one
-//! bitboard per piece type, one per colour, a 64-entry mailbox that answers
-//! "which piece is on this square?", the side to move, castling rights, the en
-//! passant target, the clocks, and an incrementally maintained Zobrist hash.
+//! [`Position`] stores per-piece-type bitboards, per-color bitboards, a
+//! 64-square mailbox for O(1) piece lookups, side to move, castling rights,
+//! en passant target, clocks, and an incrementally updated Zobrist hash.
 //!
 //! # Copy-make
 //!
-//! Moves are applied with *copy-make*: [`Position::make_move`] takes `&self` and
-//! returns a **new** position. There is no `unmake`. Instead the search keeps the
-//! parent position on the stack and simply drops the child when it returns.
+//! Rather than mutating the board in place and maintaining an undo stack,
+//! [`Position::make_move`] copies the struct by value and updates the copy.
+//! `Position` is `Copy`, 192 bytes (three 64-byte cache lines), and 64-byte
+//! aligned. Copying three cache lines is cheap, keeps search threads completely
+//! isolated, and eliminates a whole class of unmake bugs.
 //!
-//! Copy-make suits a multi-threaded engine with a cache-conscious layout. The struct is exactly 192 bytes (three 64-byte cache lines, enforced
-//! by `repr(C, align(64))`) and `Copy`, so making a move is a handful of
-//! cache-line copies followed by a few XORs. In exchange the search never has to
-//! store undo information (captured piece, previous castling rights, previous en
-//! passant square, previous hash, previous clock) or run an unmake routine, and
-//! there is no way to corrupt state by forgetting to restore it.
+//! `make_move` assumes `mv` is legal. After a double pawn push, it only sets
+//! the en passant square if an enemy pawn can actually capture there—that way
+//! positions with an unusable en passant target still hash the same for TT hits
+//! and repetition checks.
 //!
-//! # What `make_move` updates
+//! # FEN support
 //!
-//! * the piece and colour bitboards and the mailbox, for the moved piece, a
-//!   captured piece (including the en passant victim, which is not on the
-//!   destination square) and the rook when castling;
-//! * the Zobrist hash, by XOR-ing out and in only the features that changed;
-//! * castling rights, through a 64-entry mask: any move from or to a king or rook
-//!   home square removes the matching rights, which also covers captures of an
-//!   unmoved rook;
-//! * the en passant square, which is set after a double push **only if an enemy
-//!   pawn is able to capture there**. This keeps the hash identical for
-//!   positions that differ only by an unusable en passant square, which improves
-//!   transposition-table hits and repetition detection;
-//! * the halfmove clock (reset by pawn moves and captures) and the fullmove number.
-//!
-//! `make_move` assumes the move is legal. Passing an illegal move is a logic error
-//! (debug builds assert in the obvious case of an empty origin square).
-//!
-//! # Forsyth-Edwards Notation
-//!
-//! [`Position::from_fen`] and [`Position::to_fen`] convert to and from FEN.
-//! Parsing validates the input: exactly one king per side, no pawns on the first
-//! or last rank, at most eight pawns and sixteen pieces a side, the side not to
-//! move not in check, and a well-formed en passant square. Castling rights that do
-//! not match the pieces on their home squares are silently dropped, and an en
-//! passant square that no pawn can capture on is ignored. The halfmove and
-//! fullmove fields are optional.
-//!
-//! # Examples
+//! [`Position::from_fen`] validates piece counts, king counts (exactly one per
+//! side), no pawns on ranks 1/8, and that the side not to move isn't already in
+//! check. Castling flags that don't match pieces on their home squares are
+//! silently stripped, an unplayable en passant square is ignored, and the
+//! halfmove/fullmove fields are optional.
 //!
 //! ```
 //! use wustite::Position;
@@ -71,27 +48,24 @@ use crate::bitboard::Bitboard;
 use crate::types::{Color, Move, Piece, PieceType, Square, flag};
 use crate::zobrist::ZOBRIST;
 
-/// Castling-rights bit: white may castle short (e1 and h1 unmoved).
+/// Castling bit: white kingside (`K`).
 pub const WHITE_KING_SIDE: u8 = 1;
-/// Castling-rights bit: white may castle long (e1 and a1 unmoved).
+/// Castling bit: white queenside (`Q`).
 pub const WHITE_QUEEN_SIDE: u8 = 2;
-/// Castling-rights bit: black may castle short (e8 and h8 unmoved).
+/// Castling bit: black kingside (`k`).
 pub const BLACK_KING_SIDE: u8 = 4;
-/// Castling-rights bit: black may castle long (e8 and a8 unmoved).
+/// Castling bit: black queenside (`q`).
 pub const BLACK_QUEEN_SIDE: u8 = 8;
-/// All four castling-rights bits set. Castling rights are a 4-bit mask, so valid values are `0..=ALL_CASTLING`.
+/// All four castling rights set (`0b1111`).
 pub const ALL_CASTLING: u8 = 15;
 
-/// The FEN string of the standard starting position.
+/// Standard chess starting position FEN.
 pub const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
-/// Sentinel stored in the en passant field when no en passant capture is available.
+/// Sentinel value for `ep` when no en passant capture is available.
 const NO_SQUARE: u8 = 64;
 
-/// Builds the castling-rights mask table. For each square, the value is the set
-/// of rights that survive a move that starts or ends on it: the king's home
-/// square clears both of a side's rights, each rook's home square clears one.
-/// Every other square keeps all rights.
+/// Build the per-square bitmask of castling rights that survive a move touching that square.
 const fn build_castle_mask() -> [u8; 64] {
     let mut mask = [ALL_CASTLING; 64];
     mask[Square::A1.idx()] = ALL_CASTLING & !WHITE_QUEEN_SIDE;
@@ -103,13 +77,10 @@ const fn build_castle_mask() -> [u8; 64] {
     mask
 }
 
-/// The castling-rights mask, indexed by square. See [`build_castle_mask`].
+/// Castling-rights survival mask indexed by square.
 static CASTLE_MASK: [u8; 64] = build_castle_mask();
 
-/// Why a FEN string could not be turned into a [`Position`].
-///
-/// The `Display` implementation produces a readable message; the engine prints it
-/// in a UCI `info string` line when a GUI sends a bad `position fen`.
+/// Error returned when parsing a malformed or illegal FEN string.
 ///
 /// ```
 /// use wustite::Position;
@@ -123,9 +94,9 @@ static CASTLE_MASK: [u8; 64] = build_castle_mask();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FenError {
-    /// A required field (piece placement or side to move) was absent. The payload names the field.
+    /// A required field (piece placement or side to move) was missing.
     MissingField(&'static str),
-    /// A field was present but unacceptable. The payload describes the problem, for example `"each side needs exactly one king"`.
+    /// A field was malformed or violated board rules.
     Invalid(&'static str),
 }
 
@@ -140,15 +111,13 @@ impl fmt::Display for FenError {
 
 impl std::error::Error for FenError {}
 
-/// A complete chess position. See the [module documentation](crate::board) for the design.
+/// Complete, cache-aligned (192-byte) chess position.
 ///
-/// The struct is `Copy`, 192 bytes and 64-byte aligned. Its fields are private so
-/// that the redundant representations (piece bitboards, colour bitboards, mailbox
-/// and hash) can never be put out of sync from outside; the accessors below give
-/// read access and [`Position::make_move`] is the only way to advance a position.
+/// Fields are private so the bitboards, mailbox, and incremental hash can never
+/// drift out of sync. Use [`Position::make_move`] to advance the board.
 ///
-/// Two positions compare equal when every field, including the clocks, is equal.
-/// To compare positions for repetition purposes use [`Position::hash`].
+/// `PartialEq` compares every field including move clocks; for repetition or
+/// transposition equality, use [`Position::hash`].
 ///
 /// ```
 /// use wustite::{Color, PieceType, Position, Square};
@@ -174,7 +143,7 @@ pub struct Position {
 }
 
 impl Position {
-    /// A board with no pieces, white to move. Used as the starting point while parsing FEN.
+    /// Blank board with white to move, used internally while parsing FENs.
     fn empty() -> Position {
         Position {
             pieces: [Bitboard::EMPTY; 6],
@@ -189,7 +158,7 @@ impl Position {
         }
     }
 
-    /// The standard starting position.
+    /// Standard starting position.
     pub fn startpos() -> Position {
         match Position::from_fen(START_FEN) {
             Ok(pos) => pos,
@@ -197,41 +166,37 @@ impl Position {
         }
     }
 
-    /// The side whose turn it is.
+    /// Side whose turn it is.
     #[inline(always)]
     pub fn side_to_move(&self) -> Color {
         self.side
     }
 
-    /// The Zobrist hash of the position, maintained incrementally.
-    ///
-    /// It covers piece placement, castling rights, a usable en passant file and the
-    /// side to move, but not the halfmove or fullmove counters, so it is suitable as
-    /// a transposition-table key and for repetition detection.
+    /// Incrementally updated Zobrist hash (excludes move clocks).
     #[inline(always)]
     pub fn hash(&self) -> u64 {
         self.hash
     }
 
-    /// The castling rights as a bitmask of [`WHITE_KING_SIDE`], [`WHITE_QUEEN_SIDE`], [`BLACK_KING_SIDE`] and [`BLACK_QUEEN_SIDE`].
+    /// 4-bit castling rights mask (`WHITE_*` / `BLACK_*`).
     #[inline(always)]
     pub fn castling(&self) -> u8 {
         self.castling
     }
 
-    /// Plies since the last capture or pawn move, used for the fifty-move rule (a draw claim becomes available at 100).
+    /// Halfmoves since the last pawn push or capture (50-move rule triggers at 100).
     #[inline(always)]
     pub fn halfmove_clock(&self) -> u16 {
         self.halfmove
     }
 
-    /// The move number as in FEN. It starts at 1 and increments after black moves.
+    /// 1-based fullmove counter, incremented after black moves.
     #[inline(always)]
     pub fn fullmove_number(&self) -> u16 {
         self.fullmove
     }
 
-    /// The square a pawn may capture onto en passant, if any. It is only `Some` when an enemy pawn can really make the capture.
+    /// En passant target square, or `None` if no enemy pawn can capture there.
     #[inline(always)]
     pub fn ep_square(&self) -> Option<Square> {
         if self.ep == NO_SQUARE {
@@ -241,49 +206,46 @@ impl Position {
         }
     }
 
-    /// The piece standing on `sq`, if any. A single mailbox read.
+    /// Piece on `sq`, if any (O(1) mailbox read).
     #[inline(always)]
     pub fn piece_on(&self, sq: Square) -> Option<Piece> {
         self.mailbox[sq.idx()]
     }
 
-    /// The squares occupied by pieces of one colour and type, for example white rooks.
+    /// Bitboard of one side's pieces of a given type.
     #[inline(always)]
     pub fn pieces(&self, color: Color, piece_type: PieceType) -> Bitboard {
         self.pieces[piece_type.idx()] & self.colors[color.idx()]
     }
 
-    /// The squares occupied by a piece type of either colour.
+    /// Bitboard of a piece type for both sides combined.
     #[inline(always)]
     pub fn piece_bb(&self, piece_type: PieceType) -> Bitboard {
         self.pieces[piece_type.idx()]
     }
 
-    /// The squares occupied by all pieces of one colour.
+    /// Bitboard of all pieces belonging to `color`.
     #[inline(always)]
     pub fn color_bb(&self, color: Color) -> Bitboard {
         self.colors[color.idx()]
     }
 
-    /// All occupied squares.
+    /// Bitboard of every occupied square.
     #[inline(always)]
     pub fn occupied(&self) -> Bitboard {
         self.colors[0] | self.colors[1]
     }
 
-    /// The square of `color`'s king. Every valid position has exactly one king per side.
+    /// Square of `color`'s king.
     #[inline(always)]
     pub fn king_square(&self, color: Color) -> Square {
         self.pieces(color, PieceType::King).lsb()
     }
 
-    /// All pieces of **both** colours that attack `sq`, computed as if the board
-    /// occupancy were `occ`.
+    /// All pieces of both colors attacking `sq` under occupancy `occ`.
     ///
-    /// Passing a modified occupancy is the point of the parameter: static exchange
-    /// evaluation removes pieces from `occ` as captures are played so that x-ray
-    /// attackers behind them appear, and en passant legality checks remove the two
-    /// pawns involved to see whether the king would be exposed.
+    /// Taking `occ` explicitly lets SEE strip captured pieces to reveal x-rays and
+    /// lets en passant checks test king safety after both pawns disappear.
     #[inline(always)]
     pub fn attackers_to(&self, sq: Square, occ: Bitboard) -> Bitboard {
         let pawns = (pawn_attacks(Color::White, sq) & self.pieces(Color::Black, PieceType::Pawn))
@@ -299,12 +261,10 @@ impl Position {
             | (rook_attacks(sq, occ) & straight)
     }
 
-    /// Whether any piece of colour `by` attacks `sq` given the occupancy `occ`.
+    /// Return `true` if any piece of color `by` attacks `sq` under occupancy `occ`.
     ///
-    /// This is a boolean query that stops at the first attacker found, cheaper than
-    /// building the full [`Position::attackers_to`] set. King-move legality uses it
-    /// with the king removed from `occ`, so a king cannot step backwards along the
-    /// line of a checking slider.
+    /// Short-circuits on the first attacker found. King move generation calls this
+    /// with the king removed from `occ` so the king can't back up along a checking ray.
     #[inline(always)]
     pub fn attacked_by(&self, sq: Square, by: Color, occ: Bitboard) -> bool {
         let theirs = self.colors[by.idx()];
@@ -319,14 +279,14 @@ impl Position {
             || (rook_attacks(sq, occ) & straight).any()
     }
 
-    /// The enemy pieces currently giving check to the side to move. Empty when not in check.
+    /// Enemy pieces currently giving check to the side to move.
     #[inline(always)]
     pub fn checkers(&self) -> Bitboard {
         let king = self.king_square(self.side);
         self.attackers_to(king, self.occupied()) & self.colors[self.side.flip().idx()]
     }
 
-    /// Whether the side to move is in check.
+    /// `true` if the side to move is in check.
     #[inline(always)]
     pub fn in_check(&self) -> bool {
         self.attacked_by(
@@ -336,24 +296,14 @@ impl Position {
         )
     }
 
-    /// Whether `color` has at least one knight, bishop, rook or queen.
-    ///
-    /// Null-move pruning is disabled when this is `false`, because pawn endings are
-    /// where zugzwang (every move makes things worse) is common and passing would
-    /// give misleadingly good results.
+    /// `true` if `color` has at least one knight, bishop, rook, or queen (used to guard null-move pruning against zugzwang).
     #[inline(always)]
     pub fn has_non_pawn_material(&self, color: Color) -> bool {
         let others = self.pieces[PieceType::Pawn.idx()] | self.pieces[PieceType::King.idx()];
         (self.colors[color.idx()] & !others).any()
     }
 
-    /// Whether neither side can ever deliver checkmate by any sequence of legal moves
-    /// that this simple test recognises: no pawns, rooks or queens, and at most one
-    /// minor piece on the board in total.
-    ///
-    /// That covers king versus king, king and bishop versus king, and king and knight
-    /// versus king. Positions such as two knights versus a bare king are not
-    /// reported, since mate is technically possible there.
+    /// `true` for obvious dead draws: K vs K, K+B vs K, or K+N vs K (no pawns, rooks, or queens, and at most one minor total).
     pub fn insufficient_material(&self) -> bool {
         let heavy = self.pieces[PieceType::Pawn.idx()]
             | self.pieces[PieceType::Rook.idx()]
@@ -365,7 +315,7 @@ impl Position {
         minors.count() <= 1
     }
 
-    /// Adds a piece to an empty square, updating bitboards, mailbox and hash.
+    /// Place `piece` on an empty square and update bitboards, mailbox, and hash.
     #[inline(always)]
     fn put_piece(&mut self, piece: Piece, sq: Square) {
         let bit = sq.bb();
@@ -375,7 +325,7 @@ impl Position {
         self.hash ^= ZOBRIST.piece_square[piece.idx()][sq.idx()];
     }
 
-    /// Removes whatever piece is on `sq`, updating bitboards, mailbox and hash. Does nothing on an empty square.
+    /// Clear `sq` if occupied and update bitboards, mailbox, and hash.
     #[inline(always)]
     fn remove_piece(&mut self, sq: Square) {
         if let Some(piece) = self.mailbox[sq.idx()] {
@@ -387,7 +337,7 @@ impl Position {
         }
     }
 
-    /// Moves a piece to an empty destination with one XOR per bitboard. Captures must be removed first.
+    /// Slide the piece on `from` to an empty `to` square with single XOR updates.
     #[inline(always)]
     fn move_piece(&mut self, from: Square, to: Square) {
         if let Some(piece) = self.mailbox[from.idx()] {
@@ -401,11 +351,7 @@ impl Position {
         }
     }
 
-    /// Recomputes the Zobrist hash from scratch.
-    ///
-    /// [`Position::hash`] is normally maintained incrementally; this slow version is
-    /// the reference used by tests and by [`Position::is_consistent`] to prove the
-    /// incremental updates are right.
+    /// Recompute the Zobrist hash from scratch (reference check for tests and [`Position::is_consistent`]).
     pub fn compute_hash(&self) -> u64 {
         let mut hash = 0u64;
         for sq in self.occupied() {
@@ -423,12 +369,7 @@ impl Position {
         hash
     }
 
-    /// Checks the internal invariants: the piece and colour bitboards agree with the
-    /// mailbox, the two colours do not overlap, and the stored hash equals
-    /// [`Position::compute_hash`].
-    ///
-    /// Intended for tests. The test suite walks full move trees and asserts this at
-    /// every node.
+    /// Verify that bitboards, mailbox, color disjointness, and incremental hash all agree.
     pub fn is_consistent(&self) -> bool {
         let mut pieces = [Bitboard::EMPTY; 6];
         let mut colors = [Bitboard::EMPTY; 2];
@@ -444,11 +385,7 @@ impl Position {
             && self.hash == self.compute_hash()
     }
 
-    /// Returns the position after playing `mv`. The receiver is unchanged.
-    ///
-    /// `mv` must be legal in this position, for example obtained from
-    /// [`crate::movegen::legal_moves`]. See the [module documentation](crate::board)
-    /// for exactly what is updated.
+    /// Return a new position with legal move `mv` applied, leaving `self` untouched.
     ///
     /// ```
     /// use wustite::Position;
@@ -467,7 +404,7 @@ impl Position {
         next
     }
 
-    /// The mutating core of [`Position::make_move`], applied to a fresh copy.
+    /// In-place update helper called on the fresh copy inside [`Position::make_move`].
     fn apply_move(&mut self, mv: Move) {
         let us = self.side;
         let them = us.flip();
@@ -533,12 +470,7 @@ impl Position {
         self.hash ^= ZOBRIST.side;
     }
 
-    /// Returns the position after the side to move passes.
-    ///
-    /// Used by null-move pruning in the search. A null move flips the side to move,
-    /// clears the en passant square, advances the halfmove clock, and updates the
-    /// hash accordingly. It is only meaningful when the side to move is **not** in
-    /// check.
+    /// Return the position after passing the turn (flips side, clears en passant, bumps halfmove clock). Only valid when not in check.
     pub fn make_null_move(&self) -> Position {
         let mut next = *self;
         if next.ep != NO_SQUARE {
@@ -551,13 +483,10 @@ impl Position {
         next
     }
 
-    /// Parses a FEN string. See the [module documentation](crate::board) for what is
-    /// validated and what is tolerated.
+    /// Parse a FEN string into a validated [`Position`].
     ///
-    /// # Errors
-    ///
-    /// Returns [`FenError::MissingField`] when the piece placement or side-to-move
-    /// field is missing, and [`FenError::Invalid`] for malformed or illegal content.
+    /// Returns [`FenError::MissingField`] if piece placement or side-to-move is
+    /// missing, or [`FenError::Invalid`] if the board state is malformed or illegal.
     ///
     /// ```
     /// use wustite::Position;
@@ -702,8 +631,7 @@ impl Position {
         Ok(pos)
     }
 
-    /// Formats the position as a FEN string. Parsing the result with
-    /// [`Position::from_fen`] yields an equal position.
+    /// Format the position back into a FEN string.
     pub fn to_fen(&self) -> String {
         let mut out = String::with_capacity(90);
         for rank in (0..8).rev() {

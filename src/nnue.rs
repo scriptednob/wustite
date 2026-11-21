@@ -1,128 +1,47 @@
-//! NNUE: an efficiently updatable neural network evaluation.
+//! Incrementally updated NNUE evaluation (`(768 -> 128) x 2 -> 1`, SCReLU).
 //!
-//! NNUE ("Efficiently Updatable Neural Network", from the Japanese shogi
-//! community, ported to chess by Stockfish) is a small neural network whose first
-//! layer is sparse and cheap to update, which lets it run inside a
-//! search at millions of positions per second on a CPU. Wustite uses the
-//! simplest useful architecture and trains it entirely with the tools in this
-//! repository (`examples/datagen.rs` and `examples/train.rs`).
+//! Uses a compact two-perspective architecture trained with `examples/datagen.rs`
+//! and `examples/train.rs`.
 //!
-//! # Architecture
+//! # Architecture and incremental updates
 //!
-//! ```text
-//!  768 inputs (perspective A)          768 inputs (perspective B)
-//!         |  sparse, <= 32 active           |
-//!         v                                 v
-//!  [feature transformer: 768 -> 128]  [same weights, same bias]
-//!         |                                 |
-//!    accumulator A (128 x i16)         accumulator B (128 x i16)
-//!         |  SCReLU                         |  SCReLU
-//!         v                                 v
-//!    w_us . x^2   +   w_them . x^2   -> one output -> centipawns
-//! ```
+//! Each perspective has 768 binary inputs: `(enemy * 6 + piece_type) * 64 + sq`,
+//! with squares flipped vertically (`sq ^ 56`) for black so both views share
+//! one feature-transformer matrix. At inference time the side-to-move's
+//! accumulator multiplies the first 128 output weights ("us") and the opponent's
+//! multiplies the second 128 ("them"), using squared clipped ReLU
+//! (`clamp(x, 0, QA)^2`).
 //!
-//! * **Inputs.** For each of the two perspectives there are 768 binary inputs:
-//!   one for each (own or enemy, piece type, square) combination,
-//!   `2 colours x 6 piece types x 64 squares`. A position has at most 32 pieces,
-//!   so at most 32 inputs are active. See [`feature_index`].
-//! * **Perspectives.** The same weights are used twice: once with the board seen
-//!   from white's side, once from black's. "Seen from black's side" means the
-//!   ranks are flipped (`square ^ 56`) and "own" and "enemy" are swapped. The
-//!   accumulator for the side to move is paired with the output weights for
-//!   "us" and the other accumulator with the weights for "them", so the network
-//!   knows whose turn it is.
-//! * **Hidden layer.** 128 units ([`HIDDEN`]) with a `SCReLU` activation:
-//!   `clamp(x, 0, QA)^2`. The squared clipped ReLU is a little more expressive
-//!   than a plain clipped ReLU and costs one extra multiply in integer
-//!   arithmetic.
-//! * **Output.** One value: the dot product of the activated hidden units with
-//!   the output weights, rescaled to centipawns.
+//! Because the first layer is just a sum of active feature columns plus bias,
+//! [`update`] doesn't recompute it from scratch on every move—it copies the
+//! parent [`Accumulator`] and adds/subtracts the 2 to 5 features that changed.
 //!
-//! # Incremental updates
+//! # Quantization and SIMD
 //!
-//! The feature transformer is a plain sum:
-//! `accumulator = bias + sum of the weight columns of the active features`.
-//! When a move is made only two to five features change (the moved piece leaves
-//! one square and arrives on another, plus a captured piece, plus a rook when
-//! castling). So instead of recomputing the sum over all pieces, [`update`]
-//! copies the parent's [`Accumulator`] and **adds** the columns of features that
-//! appeared and **subtracts** the columns of features that disappeared. That is
-//! a handful of 128-element vector additions per move per perspective.
+//! All inference runs in integer arithmetic (`QA = 255`, `QB = 64`,
+//! `SCALE = 400`). Output weights are capped at `+-127` ([`OUTPUT_LIMIT`]) so
+//! `255 * 127 = 32385` fits in an `i16` without overflowing 16-bit SIMD lanes;
+//! [`Network::from_bytes`] rejects files that exceed this bound.
 //!
-//! The search keeps one accumulator per ply and writes the child's accumulator
-//! right before descending into it. A debug build re-derives every accumulator
-//! from scratch at each evaluation and asserts equality, and the test suite
-//! compares incremental updates with [`refresh`] after every legal move of many
-//! positions.
+//! Kernels dispatch to AVX-512BW (compile-time on Rust 1.89+), AVX2 (runtime
+//! check on x86-64), or portable scalar code. Check [`simd_description`] to see
+//! which path is active.
 //!
-//! # Quantisation
-//!
-//! All arithmetic is integer, using the usual NNUE scheme:
-//!
-//! | Constant | Value | Role |
-//! | --- | --- | --- |
-//! | [`QA`] | 255 | scale of the feature-transformer output (`i16` activations) |
-//! | [`QB`] | 64 | scale of the output weights |
-//! | [`SCALE`] | 400 | maps the network's output to centipawns |
-//! | [`OUTPUT_LIMIT`] | 127 | largest allowed magnitude of an output weight |
-//!
-//! The final score is
-//!
-//! ```text
-//! sum    = sum over hidden units of clamp(a, 0, QA)^2 * w       (both perspectives)
-//! hidden = sum / QA + output_bias
-//! score  = hidden * SCALE / (QA * QB)
-//! ```
-//!
-//! Output weights are limited to `+-127` on purpose: with an activation of at
-//! most 255, the 16-bit SIMD multiply `x * w` is at most `255 * 127 = 32385`,
-//! which fits an `i16` without overflow. [`Network::from_bytes`] rejects files that
-//! violate the limit.
-//!
-//! # SIMD
-//!
-//! Accumulator updates and the output dot product are vectorised. The
-//! implementation is chosen as follows:
-//!
-//! | Target | Implementation | Chosen |
-//! | --- | --- | --- |
-//! | x86-64 with AVX-512BW enabled at compile time | AVX-512 | at compile time (needs Rust 1.89+) |
-//! | any other x86-64 | AVX2 when the CPU has it, detected once at run time | at run time |
-//! | everything else, including ARM | portable scalar code | at compile time |
-//!
-//! [`simd_description`] reports which is active. The scalar versions
-//! ([`scalar_refresh`], [`scalar_evaluate`]) are always compiled and serve as
-//! the reference that tests compare the SIMD results against.
-//!
-//! # The network file
-//!
-//! Files use the format `WNNU` version 1, little-endian throughout:
+//! # File format (`WNNU` v1, little-endian, 197,396 bytes)
 //!
 //! | Offset | Size | Content |
 //! | --- | --- | --- |
-//! | 0 | 4 | magic bytes `WNNU` ([`MAGIC`]) |
-//! | 4 | 4 | version, `u32` ([`VERSION`]) |
-//! | 8 | 4 | number of inputs, `u32` (768) |
-//! | 12 | 4 | hidden size, `u32` (128) |
-//! | 16 | `2 * 768 * 128` | feature-transformer weights, `i16`, one 128-element column per input feature |
-//! | then | `2 * 128` | feature-transformer bias, `i16` |
-//! | then | `2 * 256` | output weights, `i16`: 128 for "us" followed by 128 for "them" |
-//! | then | 4 | output bias, `i32` |
+//! | 0 | 4 | magic `"WNNU"` ([`MAGIC`]) |
+//! | 4 | 4 | version `u32` ([`VERSION`]) |
+//! | 8 | 4 | inputs `u32` (768) |
+//! | 12 | 4 | hidden size `u32` (128) |
+//! | 16 | `2 * 768 * 128` | feature-transformer weights (`i16`, column-major by feature) |
+//! | next | `2 * 128` | feature-transformer bias (`i16`) |
+//! | next | `2 * 256` | output weights (`i16`, "us" then "them") |
+//! | last | 4 | output bias (`i32`) |
 //!
-//! The total is [`FILE_BYTES`] = 197,396 bytes. The header records the shape so
-//! that a network of a different size is rejected with a clear error instead of
-//! being misread.
-//!
-//! # The active network
-//!
-//! A process-wide network slot holds the network every new search uses. It is
-//! initialised with the network embedded in the binary (`nets/wustite.nnue`).
-//! [`load_file`] replaces it from a file and [`load_embedded`] restores the
-//! built-in one, which is what the UCI `EvalFile` option does.
-//!
-//! # Examples
-//!
-//! Evaluate a position with the built-in network:
+//! The default net (`nets/wustite.nnue`) is compiled into the binary and loaded
+//! lazily into a process-wide slot replaceable with [`load_file`].
 //!
 //! ```
 //! use wustite::{nnue, Position};
@@ -135,7 +54,7 @@
 //! assert!(score.abs() < 300);
 //! ```
 //!
-//! Update the accumulator incrementally and check it against a full recompute:
+//! Incremental updates match a full refresh bit-for-bit:
 //!
 //! ```
 //! use wustite::{nnue, Position};
@@ -163,31 +82,31 @@ use std::sync::{Arc, OnceLock, RwLock};
 use crate::board::Position;
 use crate::types::{Color, Move, Piece, PieceType, Square, flag};
 
-/// Input features per perspective: 2 colours x 6 piece types x 64 squares = 768.
+/// Binary input features per perspective (`2 * 6 * 64`).
 pub const INPUTS: usize = 768;
-/// Width of the hidden layer (the feature transformer's output): 128 units.
+/// Hidden units per perspective.
 pub const HIDDEN: usize = 128;
-/// Quantisation scale of the hidden layer. Activations are clamped to `0..=QA` before squaring.
+/// Quantization scale for feature-transformer activations (`0..=QA`).
 pub const QA: i32 = 255;
-/// Quantisation scale of the output weights.
+/// Quantization scale for output layer weights.
 pub const QB: i32 = 64;
-/// Factor converting the network's output to centipawns.
+/// Centipawn scale factor applied at the output.
 pub const SCALE: i32 = 400;
-/// Largest permitted magnitude of an output weight, chosen so a 16-bit multiply cannot overflow. Files that exceed it are rejected.
+/// Max allowed `|output_weight|` so 16-bit SIMD `clamp(a, 0, 255) * w` never overflows.
 pub const OUTPUT_LIMIT: i16 = 127;
-/// The four magic bytes, `WNNU`, that start every network file.
+/// Four-byte file header magic (`WNNU`).
 pub const MAGIC: [u8; 4] = *b"WNNU";
-/// The network file format version this build understands.
+/// Supported `WNNU` format version.
 pub const VERSION: u32 = 1;
-/// Size of the file header in bytes: magic, version, input count and hidden size.
+/// Header size in bytes (magic, version, inputs, hidden).
 pub const HEADER_BYTES: usize = 16;
-/// Exact size in bytes of a valid network file.
+/// Exact byte length of a valid v1 network file (197,396 bytes).
 pub const FILE_BYTES: usize = HEADER_BYTES + 2 * (INPUTS * HIDDEN + HIDDEN + 2 * HIDDEN) + 4;
 
-/// The network compiled into the binary from `nets/wustite.nnue`.
+/// Built-in network embedded from `nets/wustite.nnue`.
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/wustite.nnue");
 
-/// Why a network could not be loaded.
+/// Error returned when loading or validating a `.nnue` network fails.
 ///
 /// ```
 /// use wustite::nnue::{LoadError, Network};
@@ -197,27 +116,27 @@ static DEFAULT_NET: &[u8] = include_bytes!("../nets/wustite.nnue");
 /// ```
 #[derive(Debug)]
 pub enum LoadError {
-    /// The file has the wrong length.
+    /// Input length didn't match [`FILE_BYTES`].
     Size {
-        /// The length in bytes of a valid network file, [`FILE_BYTES`].
+        /// Expected byte length ([`FILE_BYTES`]).
         expected: usize,
-        /// The length in bytes of the data that was supplied.
+        /// Actual byte length read.
         found: usize,
     },
-    /// The file does not start with the `WNNU` magic bytes.
+    /// Missing `WNNU` magic bytes.
     Magic,
-    /// The file format version is not supported. The payload is the version found.
+    /// Unsupported format version.
     Version(u32),
-    /// The network was trained with a different input or hidden size than this build supports.
+    /// Network dimensions don't match `768x128`.
     Shape {
-        /// The number of input features recorded in the file header.
+        /// Input count from the file header.
         inputs: u32,
-        /// The hidden layer width recorded in the file header.
+        /// Hidden layer width from the file header.
         hidden: u32,
     },
-    /// An output weight exceeds [`OUTPUT_LIMIT`], which could overflow the 16-bit SIMD multiply.
+    /// An output weight exceeded `+-OUTPUT_LIMIT`.
     OutputRange,
-    /// The file could not be read. The payload is a message that includes the path.
+    /// Filesystem read error (message includes the path).
     Io(String),
 }
 
@@ -241,10 +160,7 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// The weights of a loaded network.
-///
-/// Create one with [`Network::from_bytes`]. Networks are immutable after loading
-/// and shared between search threads behind an `Arc`.
+/// Immutable, quantized NNUE weights shared between search threads via `Arc`.
 pub struct Network {
     ft_weights: Box<[i16]>,
     ft_bias: [i16; HIDDEN],
@@ -252,15 +168,11 @@ pub struct Network {
     out_bias: i32,
 }
 
-/// The feature-transformer output for both perspectives: two arrays of 128
-/// `i16` values (index 0 for white's view, 1 for black's).
-///
-/// The struct is 64-byte aligned so SIMD loads and stores never straddle cache
-/// lines. [`update`] derives a child's accumulator from its parent's.
+/// 64-byte aligned hidden-layer accumulators for both perspectives (`0` = white, `1` = black).
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct Accumulator {
-    /// `v[perspective][unit]`, where `perspective` is [`crate::types::Color::idx`].
+    /// Hidden unit sums indexed as `v[perspective.idx()][unit]`.
     pub v: [[i16; HIDDEN]; 2],
 }
 
@@ -272,12 +184,12 @@ impl Default for Accumulator {
     }
 }
 
-/// Reads a little-endian `i16` at a byte offset.
+/// Read a little-endian `i16` at `offset`.
 fn read_i16(bytes: &[u8], offset: usize) -> i16 {
     i16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 
-/// Reads a little-endian `u32` at a byte offset.
+/// Read a little-endian `u32` at `offset`.
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
         bytes[offset],
@@ -287,12 +199,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
-/// Encodes network parts in the `WNNU` file format.
-///
-/// Used by `examples/train.rs` to write trained networks. Expects the
-/// feature-transformer weights as `INPUTS * HIDDEN` values (one 128-element
-/// column per feature, in feature order), the bias as `HIDDEN` values and the
-/// output weights as `2 * HIDDEN` values (the "us" half first).
+/// Pack raw quantized weights into the `WNNU` v1 binary format (used by `examples/train.rs`).
 pub fn serialize(
     ft_weights: &[i16],
     ft_bias: &[i16],
@@ -312,13 +219,7 @@ pub fn serialize(
 }
 
 impl Network {
-    /// Parses a network from file contents.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`LoadError`] if the data is too short, has the wrong magic, version
-    /// or shape, has the wrong total length, or contains an output weight beyond
-    /// [`OUTPUT_LIMIT`].
+    /// Parse and validate a `WNNU` v1 byte buffer into a [`Network`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Network, LoadError> {
         if bytes.len() < HEADER_BYTES {
             return Err(LoadError::Size {
@@ -374,7 +275,7 @@ impl Network {
         })
     }
 
-    /// Encodes the network in the `WNNU` format. `Network::from_bytes(&net.to_bytes())` reproduces the same weights.
+    /// Serialize this network back into `WNNU` v1 bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         serialize(
             &self.ft_weights,
@@ -384,24 +285,17 @@ impl Network {
         )
     }
 
-    /// The 128 weights for one input feature.
+    /// Slice of 128 feature-transformer weights for one input feature.
     #[inline(always)]
     fn column(&self, feature: usize) -> &[i16] {
         &self.ft_weights[feature * HIDDEN..(feature + 1) * HIDDEN]
     }
 }
 
-/// The input-feature index (`0..768`) of `piece` standing on `sq`, as seen from
-/// `perspective`.
+/// Map `(perspective, piece, sq)` to an input index in `0..768`.
 ///
-/// ```text
-/// index = (enemy * 6 + piece_type) * 64 + square
-/// ```
-///
-/// where `enemy` is 1 when the piece's colour differs from `perspective`, and
-/// `square` is the square index, vertically flipped (`^ 56`) when the perspective
-/// is black. The two perspectives therefore see the same board as mirror images
-/// of each other, which lets one set of weights serve both colours.
+/// Mirrors ranks (`sq ^ 56`) and swaps own/enemy when `perspective == Black` so
+/// one set of weights covers both sides.
 ///
 /// ```
 /// use wustite::nnue::{feature_index, INPUTS};
@@ -419,11 +313,7 @@ pub fn feature_index(perspective: Color, piece: Piece, sq: Square) -> usize {
     (enemy * 6 + piece.piece_type().idx()) * 64 + square
 }
 
-/// Computes `acc` from scratch for `pos`: bias plus the weight column of every
-/// piece on the board, for both perspectives.
-///
-/// This is the slow path, used to initialise the root of a search and as the
-/// reference for incremental updates.
+/// Recompute both perspectives of `acc` from scratch for `pos` (used at the search root).
 pub fn refresh(net: &Network, acc: &mut Accumulator, pos: &Position) {
     for perspective in Color::ALL {
         let v = &mut acc.v[perspective.idx()];
@@ -436,7 +326,7 @@ pub fn refresh(net: &Network, acc: &mut Accumulator, pos: &Position) {
     }
 }
 
-/// Like [`refresh`] but always uses the portable scalar code. The reference implementation for tests and debug assertions.
+/// Scalar-only [`refresh`], used as a reference in tests and debug assertions.
 pub fn scalar_refresh(net: &Network, acc: &mut Accumulator, pos: &Position) {
     for perspective in Color::ALL {
         let v = &mut acc.v[perspective.idx()];
@@ -449,15 +339,7 @@ pub fn scalar_refresh(net: &Network, acc: &mut Accumulator, pos: &Position) {
     }
 }
 
-/// Computes the accumulator for the position after `mv` from its parent.
-///
-/// `pos` is the position **before** the move and `src` its accumulator; the
-/// result is written to `dst`. At most three features are removed (the moving
-/// piece, a captured piece, the castling rook's origin) and at most two are added
-/// (the arriving piece, possibly a promoted piece, the castling rook's
-/// destination).
-///
-/// A null move changes no features, so the search just copies the accumulator.
+/// Incrementally derive `dst` from parent accumulator `src` for legal move `mv` played on `pos`.
 pub fn update(net: &Network, src: &Accumulator, dst: &mut Accumulator, pos: &Position, mv: Move) {
     let us = pos.side_to_move();
     let from = mv.from_sq();
@@ -516,18 +398,14 @@ pub fn update(net: &Network, src: &Accumulator, dst: &mut Accumulator, pos: &Pos
     }
 }
 
-/// Converts the raw dot-product `sum` into centipawns: rescales by `QA`, adds the output bias, then scales by `SCALE / (QA * QB)`.
+/// Rescale the raw SCReLU dot product and add `out_bias` to produce centipawns.
 #[inline(always)]
 fn finish(net: &Network, sum: i64) -> i32 {
     let hidden = sum / QA as i64 + net.out_bias as i64;
     (hidden * SCALE as i64 / (QA * QB) as i64) as i32
 }
 
-/// Evaluates a position from its accumulator, in centipawns from the point of
-/// view of `stm`, the side to move.
-///
-/// The accumulator of `stm` is combined with the "us" output weights and the
-/// other side's with the "them" weights.
+/// Score a position in centipawns from `stm`'s perspective using its up-to-date accumulator.
 pub fn evaluate(net: &Network, acc: &Accumulator, stm: Color) -> i32 {
     let us = &acc.v[stm.idx()];
     let them = &acc.v[stm.flip().idx()];
@@ -536,7 +414,7 @@ pub fn evaluate(net: &Network, acc: &Accumulator, stm: Color) -> i32 {
     finish(net, sum)
 }
 
-/// Like [`evaluate`] but always uses the portable scalar code. SIMD and scalar results are required to be identical.
+/// Scalar-only [`evaluate`], used to verify bit-exact SIMD parity in tests.
 pub fn scalar_evaluate(net: &Network, acc: &Accumulator, stm: Color) -> i32 {
     let us = &acc.v[stm.idx()];
     let them = &acc.v[stm.flip().idx()];
@@ -545,37 +423,32 @@ pub fn scalar_evaluate(net: &Network, acc: &Accumulator, stm: Color) -> i32 {
     finish(net, sum)
 }
 
-/// The process-wide slot holding the active network. Initialised lazily from the embedded network.
+/// Lazily initialized global slot holding the active network.
 fn slot() -> &'static RwLock<Option<Arc<Network>>> {
     static SLOT: OnceLock<RwLock<Option<Arc<Network>>>> = OnceLock::new();
     SLOT.get_or_init(|| RwLock::new(Network::from_bytes(DEFAULT_NET).ok().map(Arc::new)))
 }
 
-/// The network new searches will use, or `None` if the embedded network failed to load and no other has been set.
+/// Grab a handle to the currently active network, if one is loaded.
 pub fn current() -> Option<Arc<Network>> {
     slot().read().ok().and_then(|guard| guard.clone())
 }
 
-/// Replaces the active network. Searches that are already running keep the network they started with.
+/// Swap the active network for future searches (in-flight searches keep their `Arc`).
 pub fn set_current(net: Option<Arc<Network>>) {
     if let Ok(mut guard) = slot().write() {
         *guard = net;
     }
 }
 
-/// Makes the network embedded in the binary the active one.
+/// Restore the built-in network embedded in the binary.
 pub fn load_embedded() -> Result<(), LoadError> {
     let net = Network::from_bytes(DEFAULT_NET)?;
     set_current(Some(Arc::new(net)));
     Ok(())
 }
 
-/// Loads a network from `path` and makes it the active one.
-///
-/// # Errors
-///
-/// Returns a [`LoadError`] if the file cannot be read or is not a valid network.
-/// On error the previously active network stays in place.
+/// Load a `.nnue` file from disk and make it active (leaves the old net untouched on error).
 pub fn load_file(path: &str) -> Result<(), LoadError> {
     let bytes = std::fs::read(path).map_err(|e| LoadError::Io(format!("{path}: {e}")))?;
     let net = Network::from_bytes(&bytes)?;
@@ -583,14 +456,12 @@ pub fn load_file(path: &str) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// The vector implementation in use: `"avx512"`, `"avx2"` or `"scalar"`.
+/// Active kernel name: `"avx512"`, `"avx2"`, or `"scalar"`.
 pub fn simd_description() -> &'static str {
     simd::description()
 }
 
-/// Vectorised kernels with a scalar fallback: add and subtract a weight column
-/// to an accumulator, and the SCReLU dot product. The submodule that is used
-/// depends on the compilation target; see the [module documentation](crate::nnue).
+/// Vectorized `add_assign`, `sub_assign`, and `screlu_dot` kernels with scalar fallback.
 mod simd {
     use super::{HIDDEN, QA};
 

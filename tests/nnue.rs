@@ -1,3 +1,6 @@
+//! NNUE correctness tests: incremental vs. full refresh, SIMD vs. scalar parity,
+//! perspective symmetry, feature bijection, and `WNNU` file validation.
+
 use wustite::Position;
 use wustite::movegen::legal_moves;
 use wustite::nnue::{

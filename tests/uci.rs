@@ -1,3 +1,8 @@
+//! End-to-end UCI protocol tests spawning the compiled `wustite` binary.
+//!
+//! Covers handshake/options, move-list playback, FEN + depth search, `stop` on
+//! `go infinite`, `go perft`, and `go ponder` / `ponderhit` timing.
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;

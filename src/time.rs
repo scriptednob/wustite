@@ -1,41 +1,31 @@
-//! Parsing of the UCI `go` command and time management.
+//! UCI `go` parameter parsing and time management.
 //!
-//! [`GoParams`] holds the raw parameters of a `go` command. [`build_limits`] turns
-//! them, together with the side to move, into the [`SearchLimits`]
-//! the search obeys.
+//! [`GoParams::parse`] pulls clock and limit fields out of a `go` command, and
+//! [`build_limits`] turns them into the [`SearchLimits`] used by the search.
 //!
-//! # Two limits: soft and hard
+//! # Soft and hard limits
 //!
-//! Time-controlled searches get two deadlines:
+//! Clock-based searches get two deadlines:
 //!
-//! * The **soft limit** is checked *between* iterative-deepening iterations. If
-//!   it has passed, the search stops without starting another, deeper iteration
-//!   that could not finish.
-//! * The **hard limit** is checked *inside* the search every 1024 nodes. If it
-//!   passes, the search aborts immediately and the result of the last completed
-//!   iteration is used.
+//! * The soft limit is checked after each completed iteration. Once it passes,
+//!   we stop rather than starting a deeper depth we probably won't finish.
+//! * The hard limit is checked every 1024 nodes inside the search. If it trips,
+//!   the search aborts right away and uses the last completed depth.
 //!
-//! # Budget formula
+//! # Clock formula
 //!
-//! For a clock-based search (`wtime`/`btime`), with `available` equal to the
-//! remaining time minus the *Move Overhead* option:
+//! After subtracting `Move Overhead` from the remaining clock (`available`):
 //!
 //! ```text
-//! moves_to_go = movestogo, or 30 when not given, clamped to 1..=50
+//! moves_to_go = movestogo (default 30), clamped to 1..=50
 //! optimum     = min(available / moves_to_go + 3/4 * increment, 3/4 * available)
 //! hard        = min(4 * optimum, 7/10 * available)
 //! soft        = 6/10 * optimum, clamped to 1..=hard
 //! ```
 //!
-//! The hard limit allows an unfinished iteration to run about four times past the
-//! optimum if that is what it takes to resolve a fail-low or a new best move,
-//! while never spending more than 70% of the remaining clock on a single move.
-//!
-//! `movetime` searches use `movetime - overhead` for both limits. `depth`,
-//! `nodes` and `infinite` set fixed limits instead (no clock limits for
-//! `infinite`). Every limit that does not apply is simply absent.
-//!
-//! # Examples
+//! Letting `hard` reach up to 4x the optimum gives an unfinished iteration room
+//! to recover from a fail-low while capping any single move at 70% of the clock.
+//! `movetime` sets both limits to `movetime - overhead`.
 //!
 //! ```
 //! use wustite::time::GoParams;
@@ -53,40 +43,38 @@ use std::time::{Duration, Instant};
 use crate::search::{MAX_PLY, SearchLimits};
 use crate::types::Color;
 
-/// The parameters of a UCI `go` command. A field is `None` (or `false`) when the
-/// GUI did not send it.
+/// Parsed arguments from a UCI `go` command. Unspecified fields stay `None` or `false`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GoParams {
-    /// White's remaining time in milliseconds.
+    /// White's remaining clock in milliseconds.
     pub wtime: Option<u64>,
-    /// Black's remaining time in milliseconds.
+    /// Black's remaining clock in milliseconds.
     pub btime: Option<u64>,
     /// White's increment per move in milliseconds.
     pub winc: Option<u64>,
     /// Black's increment per move in milliseconds.
     pub binc: Option<u64>,
-    /// Moves remaining until the next time control. Values below 1 are raised to 1.
+    /// Moves left until the next time control (clamped to at least 1).
     pub movestogo: Option<u64>,
-    /// Search for exactly this many milliseconds.
+    /// Exact search time in milliseconds.
     pub movetime: Option<u64>,
-    /// Search to this depth. Clamped to `1..MAX_PLY - 1`.
+    /// Depth limit in plies, clamped to `1..MAX_PLY - 1`.
     pub depth: Option<i32>,
-    /// Stop after about this many nodes.
+    /// Approximate node budget.
     pub nodes: Option<u64>,
-    /// Search until `stop` is received.
+    /// Keep searching until `stop` arrives.
     pub infinite: bool,
-    /// Search on the opponent's time. The search runs unlimited until `ponderhit` or `stop`.
+    /// Search on the opponent's clock until `ponderhit` or `stop`.
     pub ponder: bool,
-    /// Not a search: count leaf nodes to this depth, like `go perft N` in Stockfish.
+    /// Run a perft divide to this depth instead of searching.
     pub perft: Option<u32>,
 }
 
 impl GoParams {
-    /// Parses the tokens that follow `go`.
+    /// Parse the tokens after `go`.
     ///
-    /// Unknown tokens are skipped and numeric values that fail to parse are ignored,
-    /// so a GUI sending extra parameters cannot break the command. Negative times
-    /// are treated as zero.
+    /// Skips unknown keywords and unparseable numbers so non-standard GUI extensions
+    /// don't break anything. Negative clock values are clamped to 0.
     pub fn parse(tokens: &[&str]) -> GoParams {
         let mut go = GoParams::default();
         let mut i = 0;
@@ -119,12 +107,10 @@ impl GoParams {
     }
 }
 
-/// Computes the [`SearchLimits`] for a `go` command.
+/// Turn parsed `go` options into [`SearchLimits`] for `side`.
 ///
-/// `side` selects which clock applies, `overhead_ms` is the *Move Overhead*
-/// reserved for communication delays, and `start` is the moment the search
-/// began, which the search measures all elapsed time against. See the
-/// [module documentation](crate::time) for the formula.
+/// `overhead_ms` is subtracted from clock/movetime budgets to absorb GUI lag,
+/// and `start` anchors all elapsed-time checks.
 ///
 /// ```
 /// use std::time::{Duration, Instant};

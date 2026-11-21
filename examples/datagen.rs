@@ -1,3 +1,22 @@
+//! Self-play training data generator for Wustite's NNUE network.
+//!
+//! Plays fixed-node self-play games after 8 or 9 random opening plies, skipping
+//! lopsided openings (`|score| > 450` cp) and adjudicating games once one side
+//! holds `>= 1500` cp for 4 straight plies. Only quiet, non-check positions
+//! within `+-3000` cp are saved.
+//!
+//! Output is appended as `fen;score;wdl` lines, where `score` is the search
+//! score from the side to move's perspective and `wdl` is `0` (loss), `1`
+//! (draw), or `2` (win) from that same perspective.
+//!
+//! Example:
+//! ```text
+//! cargo run --release --example datagen -- \
+//!     --out data.txt --threads 4 --positions 2000000 --nodes 8000 --net nets/wustite.nnue
+//! ```
+//!
+//! Without `--net`, games are played and labeled using the classical PeSTO eval.
+
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
@@ -18,6 +37,7 @@ const ADJUDICATE_SCORE: i32 = 1500;
 const ADJUDICATE_PLIES: u32 = 4;
 const MAX_GAME_PLIES: usize = 300;
 
+/// Minimal XorShift64* RNG for opening randomization.
 struct Rng(u64);
 
 impl Rng {
@@ -37,6 +57,7 @@ impl Rng {
     }
 }
 
+/// Parsed CLI options for a datagen run.
 struct Settings {
     out: String,
     threads: usize,
@@ -46,12 +67,14 @@ struct Settings {
     params: Params,
 }
 
+/// One filtered position buffered until the game finishes and its WDL is known.
 struct Record {
     fen: String,
     score: i32,
     stm: Color,
 }
 
+/// Per-thread self-play state (private TT and heuristics).
 struct Worker {
     tt: TranspositionTable,
     heuristics: Vec<Box<Heuristics>>,
@@ -60,6 +83,7 @@ struct Worker {
 }
 
 impl Worker {
+    /// Run a fixed-node search and return `(best_move, score)`.
     fn search(&mut self, pos: &Position, hist: &[u64]) -> (wustite::Move, i32) {
         self.tt.new_search();
         let shared = SharedState::new();
@@ -78,6 +102,7 @@ impl Worker {
         (result.best_move, result.score)
     }
 
+    /// Play one self-play game from a random opening and attach final WDL labels.
     fn play(&mut self, rng: &mut Rng) -> Option<Vec<(Record, u8)>> {
         self.tt.clear();
         for heur in &mut self.heuristics {
@@ -188,6 +213,7 @@ impl Worker {
     }
 }
 
+/// Parse command-line flags (`--out`, `--threads`, `--positions`, `--nodes`, `--seed`, `--net`).
 fn parse_settings() -> Result<Settings, String> {
     let mut settings = Settings {
         out: String::from("data.txt"),

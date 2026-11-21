@@ -1,47 +1,22 @@
-//! The classical hand-written evaluation, and the bare-king "mop-up" rule.
+//! Classical PeSTO fallback evaluation and bare-king mop-up.
 //!
-//! This module is the engine's fallback evaluation. The default evaluator is the
-//! NNUE network in [`crate::nnue`]; this code is used when the network is turned
-//! off (`UseNNUE=false`), when no network could be loaded, and as the labelling
-//! function for the first round of training data.
+//! NNUE ([`crate::nnue`]) is the default evaluator. This module handles the
+//! fallback when `UseNNUE` is turned off, when no net is loaded, and when
+//! bootstrapping the first generation of self-play data.
 //!
-//! All scores are in centipawns from the point of view of the **side to move**:
-//! positive means the player to move is better. That "negamax convention" lets
-//! the search flip the sign at each ply without tracking colour.
+//! All scores are centipawns from the side to move's perspective (negamax
+//! convention: positive means the side to move is ahead).
 //!
-//! # PeSTO
-//!
-//! [`evaluate`] is Ronald Friederich's PeSTO ("Piece-Square Tables Only")
-//! evaluation. Every piece type has a material value and a 64-entry
-//! piece-square table, with **separate middlegame and endgame versions**. The two
-//! scores are blended by a *game phase* computed from the material left on the
-//! board (knight 1, bishop 1, rook 2, queen 4, total 24 in the starting
-//! position):
-//!
-//! ```text
-//! score = (mg * phase + eg * (24 - phase)) / 24
-//! ```
-//!
-//! So a position with all pieces on is scored by the middlegame tables, a bare
-//! pawn ending by the endgame tables, and anything in between by interpolation.
-//! This "tapered" evaluation avoids the abrupt jumps of a hard middlegame/endgame
-//! switch. A small tempo bonus is added for the side to move.
-//!
-//! Tables are written from white's point of view with rank 8 first, and a
-//! compile-time `const fn` expands them into per-piece, per-square arrays
-//! (value plus piece-square bonus) for both colours, so evaluating a piece is one
-//! array read.
-//!
-//! # Mop-up
-//!
-//! [`bare_king_eval`] handles positions where one side has only a king and the
-//! other has at least a rook or queen. The neural network has essentially never
-//! seen such positions and its output there is noisy enough that pruning could
-//! hide a short mate. The mop-up rule is a smooth, monotonic gradient that
-//! steers the search toward the standard mating technique: push the bare king
-//! to the edge and bring the winning king close.
-//!
-//! # Examples
+//! * **PeSTO ([`evaluate`]):** Ronald Friederich's tapered piece-square tables.
+//!   Middlegame and endgame scores are blended by remaining non-pawn material
+//!   (phase weight: N=1, B=1, R=2, Q=4, max 24), plus a small tempo bonus.
+//!   Material values and PSTs are folded into combined `[piece][square]` tables
+//!   at compile time.
+//! * **Mop-up ([`bare_king_eval`]):** Overrides the network when one side has
+//!   only a king and the other has at least a rook or queen. Self-play rarely
+//!   visits these endings so the net can get noisy there; a simple gradient
+//!   pushing the lone king to the edge and bringing our king closer lets the
+//!   search find mate cleanly.
 //!
 //! ```
 //! use wustite::Position;
@@ -59,19 +34,19 @@
 use crate::board::Position;
 use crate::types::{Color, Piece, PieceType};
 
-/// How much each piece type (pawn through king) contributes to the game phase.
+/// Game-phase weight per piece type (P, N, B, R, Q, K).
 const PHASE_WEIGHT: [i32; 6] = [0, 1, 1, 2, 4, 0];
-/// The phase of the starting position: 2 x (2 knights + 2 bishops) + 2 x 2 rooks x 2 + 2 queens x 4 = 24.
+/// Maximum game phase (starting position total = 24).
 const TOTAL_PHASE: i32 = 24;
-/// Bonus, in centipawns, for having the move.
+/// Side-to-move tempo bonus in centipawns.
 const TEMPO: i32 = 10;
 
-/// Middlegame material values in centipawns (pawn, knight, bishop, rook, queen, king).
+/// PeSTO middlegame material values (cp).
 const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
-/// Endgame material values in centipawns. Also used by [`bare_king_eval`] as the material term.
+/// PeSTO endgame material values (cp), also reused by [`bare_king_eval`].
 const EG_VALUE: [i32; 6] = [94, 281, 297, 512, 936, 0];
 
-/// Middlegame piece-square tables, indexed `[piece type][square]`, written with rank 8 first.
+/// PeSTO middlegame piece-square tables from white's view (rank 8 first).
 #[rustfmt::skip]
 const MG_PST: [[i32; 64]; 6] = [
     [
@@ -136,7 +111,7 @@ const MG_PST: [[i32; 64]; 6] = [
     ],
 ];
 
-/// Endgame piece-square tables, same layout as [`MG_PST`].
+/// PeSTO endgame piece-square tables from white's view (rank 8 first).
 #[rustfmt::skip]
 const EG_PST: [[i32; 64]; 6] = [
     [
@@ -201,10 +176,7 @@ const EG_PST: [[i32; 64]; 6] = [
     ],
 ];
 
-/// Expands value and piece-square tables into a `[piece][square]` table for all
-/// twelve coloured pieces. White reads the table mirrored vertically (`sq ^ 56`)
-/// because the tables are written rank 8 first; black reads it directly, which
-/// gives the symmetry the tests check.
+/// Fold material + PST into a `[piece][square]` lookup table for both colors (flips white vertically since tables start at rank 8).
 const fn build_table(value: &[i32; 6], pst: &[[i32; 64]; 6]) -> [[i32; 64]; 12] {
     let mut table = [[0i32; 64]; 12];
     let mut piece = 0;
@@ -220,16 +192,12 @@ const fn build_table(value: &[i32; 6], pst: &[[i32; 64]; 6]) -> [[i32; 64]; 12] 
     table
 }
 
-/// Material plus piece-square bonus for every coloured piece on every square, middlegame.
+/// Combined middlegame material + PST table.
 static MG_TABLE: [[i32; 64]; 12] = build_table(&MG_VALUE, &MG_PST);
-/// Material plus piece-square bonus for every coloured piece on every square, endgame.
+/// Combined endgame material + PST table.
 static EG_TABLE: [[i32; 64]; 12] = build_table(&EG_VALUE, &EG_PST);
 
-/// Static evaluation of `pos` in centipawns from the side to move's perspective.
-///
-/// Uses PeSTO tapered piece-square tables plus a small tempo bonus. The function
-/// is symmetric: mirroring the board and swapping the colours gives the same
-/// score.
+/// Tapered PeSTO static evaluation in centipawns from the side to move's perspective.
 pub fn evaluate(pos: &Position) -> i32 {
     let mut mg = 0i32;
     let mut eg = 0i32;
@@ -257,23 +225,17 @@ pub fn evaluate(pos: &Position) -> i32 {
     score + TEMPO
 }
 
-/// Distance of each file or rank from the centre of the board: 3 on the edge, 0 on the central pair.
+/// File/rank distance from the center squares (`0` in the middle, `3` on the edge).
 const CENTER_DISTANCE: [i32; 8] = [3, 2, 1, 0, 0, 1, 2, 3];
-/// Centipawns awarded per step the bare king is pushed from the centre.
+/// Centipawns per step the bare king is pushed toward the edge.
 const MOP_UP_EDGE: i32 = 40;
-/// Centipawns awarded per step the winning king approaches the bare king.
+/// Centipawns per Manhattan step our king closes in on the bare king.
 const MOP_UP_CLOSE: i32 = 14;
 
-/// Mop-up evaluation for positions where one side has only a king and the other
-/// side has at least a rook or queen. Returns `None` for every other position.
+/// Mop-up eval when one side has only a king and the other has at least a rook or queen.
 ///
-/// The score is the stronger side's material (using endgame values) plus a bonus
-/// for driving the bare king toward the edge and a bonus for bringing the kings
-/// close together. It is returned from the side to move's perspective like
-/// [`evaluate`].
-///
-/// The search calls this before consulting the network, so these endings are
-/// never scored by the net.
+/// Returns `None` for all other positions. Checked before NNUE in the search so
+/// basic mating endings don't get tripped up by network noise.
 pub fn bare_king_eval(pos: &Position) -> Option<i32> {
     for strong in Color::ALL {
         let weak = strong.flip();

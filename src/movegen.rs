@@ -1,54 +1,28 @@
-//! Fully legal move generation.
+//! Fully legal, allocation-free move generation.
 //!
-//! [`generate`] produces only legal moves. There is no pseudo-legal pass followed
-//! by a make-and-test filter: legality is built into the generation, so every
-//! move written to the list can be played without further checks. That removes
-//! the most expensive part of a typical pseudo-legal generator and keeps the
-//! search loop free of "was that move legal?" branches.
+//! [`generate`] only writes legal moves into a stack-allocated [`MoveList`], so
+//! the search never has to make-and-reject illegal pseudo-legal moves.
 //!
-//! # How legality is enforced
+//! # How legality is checked up front
 //!
-//! 1. **King moves** are generated first. A destination is kept only if no enemy
-//!    piece attacks it, evaluated with the king removed from the occupancy so
-//!    that a slider's ray "sees through" the king's current square.
-//! 2. **Double check** ends generation: only king moves can answer it.
-//! 3. **Pins** are found by looking at enemy sliders that would attack the king
-//!    on an empty board. If exactly one piece stands between such a slider and the
-//!    king, and it is ours, it is pinned. Pinned pieces may only move along the
-//!    line through the king and the pinned piece ([`crate::attacks::line`]).
-//! 4. **Single check**: every non-king move must either capture the checker or
-//!    land on a square between the checker and the king
-//!    ([`crate::attacks::between`]). This set is the `target` mask. When not in
-//!    check the mask is the whole board.
-//! 5. **En passant** is the one move whose legality cannot be decided by pin
-//!    masks, because it removes two pawns from the same rank at once and can
-//!    expose the king horizontally. It is verified by recomputing the attackers
-//!    of the king on the post-capture occupancy.
-//! 6. **Castling** requires the right, empty squares between king and rook, and
-//!    that the king does not pass through attacked squares. It is never generated
-//!    while in check.
+//! 1. King moves go first, testing each target against enemy attacks with the
+//!    king removed from occupancy (so sliding checks don't get blocked by the
+//!    king's own square).
+//! 2. In double check, return right away—only king moves can get out of it.
+//! 3. Detect pinned pieces by finding enemy sliders aligned with our king that
+//!    have a single friendly blocker in between, and restrict those pieces to
+//!    [`crate::attacks::line`].
+//! 4. In single check, restrict non-king moves to capturing the checker or
+//!    blocking on [`crate::attacks::between`].
+//! 5. En passant verifies king safety on the post-capture occupancy directly,
+//!    catching the rare horizontal discovered pin when both pawns vanish from
+//!    the same rank.
+//! 6. Castling checks rights, empty squares, and non-attacked king transit
+//!    squares (skipped completely while in check).
 //!
-//! # Move-generation stages
-//!
-//! [`generate`] is generic over a `const MODE: u8`, which the compiler turns into
-//! three separate specialised functions with the unused branches removed:
-//!
-//! | Mode | Constant | Generates |
-//! | --- | --- | --- |
-//! | all legal moves | [`GEN_ALL`] | captures, promotions and quiet moves |
-//! | tactical moves | [`GEN_TACTICAL`] | captures, en passant and promotions |
-//! | quiet moves | [`GEN_QUIET`] | non-captures (including castling and double pushes) |
-//!
-//! Quiescence search uses `GEN_TACTICAL`. When in check it needs every evasion,
-//! so it uses `GEN_ALL` instead. Quiet promotions are classed as tactical.
-//!
-//! # Fixed-size output
-//!
-//! [`MoveList`] is a stack-allocated array of [`MAX_MOVES`] moves plus a length.
-//! There are no heap allocations anywhere in move generation. The largest known
-//! number of legal moves in a reachable position is 218, so 256 is a safe bound.
-//!
-//! # Examples
+//! `const MODE: u8` lets the compiler emit three stripped-down variants:
+//! [`GEN_ALL`], [`GEN_TACTICAL`] (captures, en passant, and all promotions),
+//! and [`GEN_QUIET`].
 //!
 //! ```
 //! use wustite::Position;
@@ -77,24 +51,20 @@ use crate::board::{
 };
 use crate::types::{Color, Move, PieceType, Square, flag};
 
-/// Capacity of a [`MoveList`]. No reachable chess position has more than 218 legal moves.
+/// Fixed capacity of [`MoveList`] (the max legal moves in any reachable position is 218).
 pub const MAX_MOVES: usize = 256;
 
-/// [`generate`] mode: every legal move.
+/// Generate every legal move.
 pub const GEN_ALL: u8 = 0;
-/// [`generate`] mode: captures, en passant captures and all promotions.
+/// Generate captures, en passant, and all promotions (including quiet promotions).
 pub const GEN_TACTICAL: u8 = 1;
-/// [`generate`] mode: legal moves that are neither captures nor promotions (including castling and pawn pushes).
+/// Generate non-capturing, non-promoting moves (including castling and pawn pushes).
 pub const GEN_QUIET: u8 = 2;
 
-/// A fixed-capacity, stack-allocated list of moves.
+/// Stack-allocated move buffer (capacity [`MAX_MOVES`], ~512 bytes).
 ///
-/// `MoveList` dereferences to `[Move]`, so all slice methods work: `len`, `iter`,
-/// `swap`, indexing, `contains`, sorting and so on. Only [`MoveList::push`] and
-/// [`MoveList::clear`] change the length.
-///
-/// The backing array is [`MAX_MOVES`] entries, about 512 bytes, which is cheap to
-/// create at every search node.
+/// Derefs to `[Move]`, so indexing, slicing, `iter`, `swap`, and `contains` all
+/// work out of the box.
 ///
 /// ```
 /// use wustite::{Move, MoveList, Square};
@@ -115,7 +85,7 @@ pub struct MoveList {
 }
 
 impl MoveList {
-    /// An empty list.
+    /// Create an empty move list.
     #[inline(always)]
     pub const fn new() -> MoveList {
         MoveList {
@@ -124,19 +94,14 @@ impl MoveList {
         }
     }
 
-    /// Appends a move.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the list already holds [`MAX_MOVES`] moves, which cannot happen with
-    /// moves from [`generate`].
+    /// Append a move. Panics if the list already has [`MAX_MOVES`] entries.
     #[inline(always)]
     pub fn push(&mut self, mv: Move) {
         self.moves[self.len] = mv;
         self.len += 1;
     }
 
-    /// Empties the list without touching the backing array.
+    /// Reset the length to zero without zeroing the array.
     #[inline(always)]
     pub fn clear(&mut self) {
         self.len = 0;
@@ -165,9 +130,9 @@ impl DerefMut for MoveList {
     }
 }
 
-/// Every legal move in `pos`. Shorthand for [`generate`] with [`GEN_ALL`].
+/// Generate and return all legal moves in `pos`.
 ///
-/// An empty result means checkmate (when [`Position::in_check`]) or stalemate.
+/// An empty list means checkmate (if `pos.in_check()`) or stalemate.
 ///
 /// ```
 /// use wustite::Position;
@@ -184,11 +149,10 @@ pub fn legal_moves(pos: &Position) -> MoveList {
     list
 }
 
-/// Finds the legal move whose UCI text equals `text`, such as `"e2e4"` or `"a7a8q"`.
+/// Match a UCI move string (like `"e2e4"` or `"a7a8q"`) against the legal moves in `pos`.
 ///
-/// Whitespace around the text is ignored. Returns `None` when no legal move in
-/// `pos` has that notation, so this doubles as a legality check for GUI input.
-/// Castling uses the king's two-square move (`e1g1`), as in standard UCI.
+/// Returns `None` if the move is malformed or illegal, so UCI input can use
+/// this directly for validation.
 ///
 /// ```
 /// use wustite::Position;
@@ -206,7 +170,7 @@ pub fn parse_move(pos: &Position, text: &str) -> Option<Move> {
         .find(|mv| mv.to_string() == text)
 }
 
-/// Pushes one move per destination in `targets`, all from the same origin with the same flags.
+/// Push one move per bit in `targets` sharing `from` and `flags`.
 #[inline(always)]
 fn emit(list: &mut MoveList, from: Square, targets: Bitboard, flags: u16) {
     for to in targets {
@@ -214,7 +178,7 @@ fn emit(list: &mut MoveList, from: Square, targets: Bitboard, flags: u16) {
     }
 }
 
-/// Pushes pawn moves for a whole target set at once. The origin of each move is recovered by subtracting `delta` from its destination.
+/// Push shifted pawn moves, recovering each origin square as `to - delta`.
 #[inline(always)]
 fn emit_pawn_moves(list: &mut MoveList, targets: Bitboard, delta: i8, flags: u16) {
     for to in targets {
@@ -222,7 +186,7 @@ fn emit_pawn_moves(list: &mut MoveList, targets: Bitboard, delta: i8, flags: u16
     }
 }
 
-/// Pushes the four promotion moves (queen, rook, bishop, knight) for every target square, as captures when `capture` is set.
+/// Push all four promotion choices (Q, R, B, N) for every square in `targets`.
 #[inline(always)]
 fn emit_promotions(list: &mut MoveList, targets: Bitboard, delta: i8, capture: bool) {
     let extra = if capture { flag::PROMO_CAPTURE_BIT } else { 0 };
@@ -235,15 +199,9 @@ fn emit_promotions(list: &mut MoveList, targets: Bitboard, delta: i8, capture: b
     }
 }
 
-/// Appends the legal moves of `pos` selected by `MODE` to `list`.
+/// Append legal moves matching `MODE` (`GEN_ALL`, `GEN_TACTICAL`, or `GEN_QUIET`) to `list`.
 ///
-/// `MODE` is one of [`GEN_ALL`], [`GEN_TACTICAL`] or [`GEN_QUIET`]. The list is
-/// **not** cleared first, so callers can accumulate several stages. See the
-/// [module documentation](crate::movegen) for how legality is guaranteed.
-///
-/// Generation order is: king moves, then knights, bishops, rooks and queens,
-/// then pawns, en passant and castling. Callers that care about order (the
-/// search) re-sort by score.
+/// Does not clear `list` first so callers can combine stages if needed.
 ///
 /// ```
 /// use wustite::{MoveList, Position};
@@ -347,12 +305,7 @@ pub fn generate<const MODE: u8>(pos: &Position, list: &mut MoveList) {
     }
 }
 
-/// Pawn pushes, double pushes, captures and promotions for a set of pawns,
-/// restricted to the destination mask `target` (check evasion and pin masks).
-///
-/// Pushes and captures are computed for the whole set with shifts rather than one
-/// pawn at a time. Pinned pawns are handled by calling this once per pawn with
-/// the target restricted to the pin line.
+/// Emit bulk-shifted pawn pushes, double pushes, captures, and promotions clipped to `target`.
 #[inline(always)]
 fn generate_pawns<const MODE: u8>(
     us: Color,
@@ -418,10 +371,7 @@ fn generate_pawns<const MODE: u8>(
     }
 }
 
-/// En passant captures, verified by recomputing king safety on the occupancy
-/// after both pawns have left their squares. That catches the rare "discovered
-/// rank pin" where capturing removes two blockers between a rook or queen and the
-/// king.
+/// Emit legal en passant captures, checking post-capture occupancy for horizontal discovered pins.
 fn generate_en_passant(
     pos: &Position,
     us: Color,
@@ -444,9 +394,7 @@ fn generate_en_passant(
     }
 }
 
-/// Castling moves for `us`, when the right exists, the squares between king and
-/// rook are empty and the king's start, transit and destination squares are not
-/// attacked. Never called while in check.
+/// Emit legal kingside/queenside castling moves. Caller ensures we aren't in check.
 fn generate_castling(pos: &Position, us: Color, occ: Bitboard, list: &mut MoveList) {
     let them = us.flip();
     let rights = pos.castling();

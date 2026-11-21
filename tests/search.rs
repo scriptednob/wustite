@@ -1,3 +1,9 @@
+//! Search, evaluation, SEE, and transposition-table integration tests.
+//!
+//! Checks exact mate distances (default and all-features-on), PV legality,
+//! single-thread determinism, time/node limits, Lazy SMP, PeSTO symmetry,
+//! pin-aware SEE, concurrent lockless TT stress, and bare-king mop-up.
+
 use std::time::{Duration, Instant};
 
 use wustite::Position;

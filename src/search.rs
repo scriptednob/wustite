@@ -1,166 +1,64 @@
-//! The search: alpha-beta with principal variation search, iterative deepening and
-//! Lazy SMP.
+//! Alpha-beta search (fail-soft PVS), iterative deepening, pruning, and Lazy SMP.
 //!
-//! Given a position and a set of limits, it looks
-//! ahead through the game tree and returns the best move it can find. The public
-//! entry points are [`think`] (full control, used by the UCI layer) and
-//! [`search_depth`] (a convenience for fixed-depth searches). The tunable switches
-//! live in [`Params`].
+//! Use [`think`] when you want full control over limits, shared stop flags,
+//! persistent heuristics, and multi-threading (what [`crate::uci`] calls), or
+//! [`search_depth`] for quick single-threaded fixed-depth searches.
 //!
-//! # Overview
+//! Scores are negamax centipawns inside `(-INFINITY, INFINITY)`. Forced mate in
+//! `N` plies scores `MATE - N`, so shorter mates always beat longer ones;
+//! anything at or past [`MATE_IN_MAX`] formats as `mate` via [`format_score`].
 //!
-//! ```text
-//! think
-//!  |-- spawns helper searchers (Lazy SMP), all sharing one TranspositionTable
-//!  `-- main searcher: iterate
-//!       for depth in 1..=max_depth            iterative deepening
-//!         aspiration window around the last score
-//!           search<PV = true>(root)           principal variation search
-//!             search<PV = false>(...)         zero-window scouts
-//!               qsearch(...)                  captures only, at depth 0
-//! ```
+//! # Search structure
 //!
-//! All scores are centipawns from the side to move's point of view (negamax),
-//! bounded by [`INFINITY`]. Mate scores are `MATE - ply` (the sooner the mate,
-//! the higher the score); anything at or beyond [`MATE_IN_MAX`] is a mate score
-//! and is displayed by [`format_score`] as `mate N`.
+//! * **Root loop:** Iterative deepening from depth 1 up to the limit, adding
+//!   aspiration windows from depth 5 onward (`aspiration_delta`, growing by 50%
+//!   on fail-high/low and opening fully past 500 cp).
+//! * **PVS core:** Fail-soft negamax generic over `const PV: bool`. The first
+//!   move at a node searches the full window; later moves try a zero-window
+//!   scout `(alpha, alpha + 1)` first and only re-search on a surprise.
+//! * **Quiescence:** At depth 0, resolves captures and promotions with
+//!   stand-pat and SEE filtering (or all evasions when in check).
+//! * **Lazy SMP:** With multiple threads, helpers search the same root using
+//!   staggered depth skips (`SKIP_SIZE`/`SKIP_PHASE`) and cooperate strictly
+//!   through the shared transposition table. Only thread 0 checks limits and
+//!   prints UCI `info` lines.
 //!
-//! # Fail-soft negamax with PVS
+//! # Techniques and flags
 //!
-//! The core is a negamax alpha-beta search that is *fail-soft*: a node returns
-//! the best score it actually found even when it falls outside the window, which
-//! gives the transposition table tighter bounds than clamping to alpha/beta.
+//! Each toggle below lives in [`Params`] and can be flipped via hidden UCI
+//! options for SPRT testing. Flags that are off by default didn't pass testing
+//! yet but remain in the codebase to experiment with. All pruning/reductions
+//! back off near mate scores so forced mates stay exact.
 //!
-//! It is a *principal variation search*: the first move at each node is searched
-//! with the full window `(alpha, beta)`; every later move is first tried with a
-//! cheap *zero-window* `(alpha, alpha + 1)` that only asks "is this move better
-//! than the best so far?". Only if the answer is yes (and the node is on the
-//! principal variation) is the move re-searched with the full window. Good move
-//! ordering makes the first move the best most of the time, so the zero-window
-//! scouts nearly always confirm that and cost little. The search is generic over
-//! `const PV: bool`, so the compiler emits separate PV and non-PV versions with
-//! the PV-only code removed from the latter.
-//!
-//! # Iterative deepening and aspiration windows
-//!
-//! [`think`] searches depth 1, then 2, then 3 and so on. Each iteration fills the transposition table and history tables that make the
-//! next one faster, the best move is always available if time runs out, and the
-//! time manager gets a clean point to decide whether to start another iteration.
-//!
-//! From depth 5 the root search uses an **aspiration window**: instead of
-//! `(-INFINITY, INFINITY)` it searches `(previous - delta, previous + delta)` with
-//! `delta` starting at [`Params::aspiration_delta`]. A narrow window cuts far more
-//! of the tree. If the result falls outside the window the search is repeated with
-//! the failing side widened (`delta` grows by half each time and the window opens
-//! fully beyond 500).
-//!
-//! # Search enhancements
-//!
-//! Each of these has a switch in [`Params`] and a hidden UCI option (see
-//! [`crate::uci`]). "Default" means on in [`Params::default`].
-//!
-//! **Pruning and reductions**
-//!
-//! | Technique | Default | What it does |
+//! | Technique | Default | Summary |
 //! | --- | --- | --- |
-//! | Check extension | always | A node in check searches one ply deeper. |
-//! | Mate-distance pruning | always | Bounds alpha and beta by the shortest and longest possible mate from this ply. |
-//! | Transposition-table cutoff | always | Non-PV nodes return a stored score when its depth and bound suffice. |
-//! | Internal iterative reduction (`iir`) | on | With no table move at depth 4 or more, search one ply shallower. |
-//! | Reverse futility pruning (`rfp`) | on | At depth 8 or less, if `eval - margin * depth >= beta`, return eval. |
-//! | Razoring (`razoring`) | off | At depth 3 or less, if eval is far below alpha, verify with a quiescence search. |
-//! | Null-move pruning (`nmp`) | on | Give the opponent a free move; if that still fails high, prune. Reduction `3 + depth/4 + min((eval-beta)/200, 3)`. Disabled without non-pawn material and directly after another null move. At depth 12 or more the result is verified by a reduced real search with null moves restricted. |
-//! | ProbCut (`probcut`) | off | Try SEE-good captures against a raised beta; if one refutes it with a shallow search, prune. |
-//! | Late move reductions (`lmr`) | on | Later quiet moves are searched shallower, by a logarithmic table, and re-searched if they surprise. |
-//! | Late move pruning (`lmp`) | on | At depth 6 or less, skip quiet moves beyond `3 + depth^2` (half that when not improving). |
-//! | Futility pruning (`futility`) | on | At depth 6 or less, skip quiet moves when `eval + 100 + 120 * depth <= alpha`. |
-//! | SEE pruning (`seepruning`) | on | At depth 8 or less, skip moves that lose too much material by static exchange. |
-//! | History pruning (`histpruning`) | off | Skip quiet moves with very negative history at low depth. |
-//! | History-based LMR (`histlmr`) | off | Reduce less for moves with good history, more for bad. |
-//!
-//! **Extensions**
-//!
-//! | Technique | Default | What it does |
-//! | --- | --- | --- |
-//! | Singular extensions (`singular`) | on | If the table move is much better than all alternatives (verified by a reduced search that excludes it), extend it by one ply, or two in non-PV nodes when it is better by a wide margin. If even the alternatives beat the bound, return (multi-cut); if the table score already beats beta, search the move one ply shallower (negative extension). |
-//!
-//! **Evaluation and ordering**
-//!
-//! | Technique | Default | What it does |
-//! | --- | --- | --- |
-//! | TT-based evaluation (`tteval`) | on | A stored score that is a valid bound in the right direction replaces the static evaluation as the node's estimate. |
-//! | Continuation history (`conthistory`) | on | History scores conditioned on the previous one and two moves. |
-//! | Capture history (`capturehistory`) | off | History for captures by (piece, destination, victim). |
-//!
-//! Techniques marked off were implemented and tested but did not show a
-//! measurable gain in match testing, and remain behind flags.
-//!
-//! Pruning and reductions are suspended when `alpha` is a mate score or `beta` is
-//! a negated mate score, so that the shortest mate is always found.
+//! | Check extension | always | Extend 1 ply while in check |
+//! | Mate-distance pruning | always | Tighten `(alpha, beta)` to fastest possible mate from this ply |
+//! | TT cutoffs | always | Return deep enough matching bounds on non-PV nodes |
+//! | Internal iterative reduction (`iir`) | on | Reduce 1 ply at depth >= 4 when no TT move exists |
+//! | Reverse futility (`rfp`) | on | At depth <= 8, return eval if `eval - margin * (depth - improving) >= beta` |
+//! | Null-move pruning (`nmp`) | on | Free move with `R = 3 + depth/4 + min((eval - beta)/200, 3)`; verified at depth >= 12 |
+//! | Late move reductions (`lmr`) | on | Reduce late quiet moves via compile-time log table; re-search if they beat alpha |
+//! | Late move pruning (`lmp`) | on | At depth <= 6, skip late quiets past `3 + depth^2` (halved if not improving) |
+//! | Futility pruning (`futility`) | on | At depth <= 6, skip quiets when `eval + 100 + 120 * depth <= alpha` |
+//! | SEE pruning (`seepruning`) | on | At depth <= 8, skip moves whose SEE falls below `-margin * depth` |
+//! | Singular extensions (`singular`) | on | Extend a clearly superior TT move (+1, or +2 non-PV), multi-cut, or negative-extend |
+//! | TT eval (`tteval`) | on | Refine static eval with a directionally valid TT score |
+//! | Continuation history (`conthistory`) | on | Quiet history conditioned on 1- and 2-ply previous moves |
+//! | Razoring (`razoring`) | off | Verify low-eval shallow nodes with qsearch |
+//! | ProbCut (`probcut`) | off | Shallow tactical search against a raised beta |
+//! | Capture history (`capturehistory`) | off | History table for captures by `(piece, to, victim)` |
+//! | History pruning / LMR (`histpruning`, `histlmr`) | off | Prune or adjust LMR based on quiet history |
 //!
 //! # Move ordering
 //!
-//! Alpha-beta is fast only if the best move is tried first. Moves are scored once
-//! per node, and the highest-scoring unplayed move is picked each step (a
-//! selection sort, since most nodes are cut off after one or two moves).
-//!
-//! | Priority | Class | Score |
-//! | --- | --- | --- |
-//! | 1 | Transposition-table move | `1 << 30` |
-//! | 2 | Winning or equal captures (SEE >= 0) and queen promotions | `1 << 28` + MVV-LVA |
-//! | 3 | First killer move | `(1 << 26) + 1` |
-//! | 4 | Second killer move | `1 << 26` |
-//! | 5 | Counter move | `1 << 25` |
-//! | 6 | Other quiets | butterfly history plus continuation history |
-//! | 7 | Losing captures and under-promotions | `-(1 << 24)` + MVV-LVA |
-//!
-//! *MVV-LVA* is "most valuable victim, least valuable attacker": captures are
-//! ordered by victim value first, then cheapest attacker.
-//! *Killer moves* are quiet moves that caused a beta cutoff at the same ply in a
-//! sibling branch. The *counter move* is the reply that last refuted the
-//! opponent's previous move. *History* tables count how often a quiet move
-//! caused cutoffs; bonuses are applied with a *gravity* formula that
-//! keeps entries bounded without explicit clamping.
-//!
-//! # Quiescence search
-//!
-//! At depth zero the search runs a quiescence search,
-//! which keeps searching **captures and promotions only** until the position is
-//! "quiet". The static evaluation acts as a *stand pat* score: the side to move is
-//! assumed able to decline all captures, so the evaluation is a lower bound.
-//! Captures that SEE says lose material are skipped. When in check, every
-//! evasion is searched, because standing pat would be illegal.
-//!
-//! # Draws
-//!
-//! A position scores 0 when it is a draw by insufficient material, by the
-//! fifty-move rule (the clock reaches 100, unless the side to move is checkmated),
-//! or by repetition. Repetition is detected against both the game history sent
-//! by the GUI and the current search path: a position repeated within the search
-//! counts as a draw on its first recurrence, while one that only occurred in the
-//! game history before the root must already have occurred twice.
-//!
-//! # Lazy SMP
-//!
-//! With `Threads > 1`, [`think`] spawns one extra searcher thread per helper.
-//! Every thread searches the same root with its own stack, history tables and
-//! accumulators, and they cooperate **only** through the shared transposition
-//! table. This is "Lazy SMP". Helper threads skip some depths in a staggered
-//! pattern so they do not all search identical iterations, and the table steers
-//! them into different parts of the tree. Only the main thread (id 0) decides
-//! when to stop and reports results.
-//!
-//! # Time and stopping
-//!
-//! Every 1024 nodes a searcher flushes its node count into [`SharedState`] and
-//! checks the stop flag. The main thread also checks the node limit and the hard
-//! time limit. Pondering is supported: while [`SharedState::pondering`] is set the
-//! clock does not run, and on `ponderhit` the time already spent is credited
-//! through [`SharedState::ponder_offset_ms`].
-//!
-//! # Examples
-//!
-//! A fixed-depth search, finding a mate in one:
+//! Moves are scored once and picked lazily via partial selection sort (since
+//! cutoffs usually happen within the first few moves):
+//! 1. TT move
+//! 2. Good/equal captures (SEE >= 0) and queen promotions (MVV-LVA)
+//! 3. Killer 1, Killer 2, Counter move
+//! 4. Quiet moves by butterfly + continuation history (updated with gravity)
+//! 5. Losing captures and under-promotions
 //!
 //! ```
 //! use wustite::Position;
@@ -172,7 +70,7 @@
 //! assert!(result.score >= MATE_IN_MAX);
 //! ```
 //!
-//! Searching with explicit limits and options:
+//! Full call with explicit limits and state:
 //!
 //! ```
 //! use wustite::search::{think, Heuristics, Params, SearchLimits, SharedState};
@@ -211,43 +109,41 @@ use crate::see::{SEE_VALUE, see_ge};
 use crate::tt::{Bound, TranspositionTable};
 use crate::types::{Color, Move, PieceType};
 
-/// The deepest ply the search will reach, including quiescence. Sizes the per-thread stack arrays.
+/// Maximum search ply (including quiescence), used to size stack arrays.
 pub const MAX_PLY: usize = 128;
-/// Larger than any real score. The initial alpha-beta window is `(-INFINITY, INFINITY)`.
+/// Score bound larger than any real evaluation or mate score.
 pub const INFINITY: i32 = 32_000;
-/// The score of being checkmated at ply 0, negated for the opponent. A mate in N plies scores `MATE - N`, so shorter mates score higher.
+/// Base checkmate score (`MATE - ply` for winning mates).
 pub const MATE: i32 = 31_000;
-/// Scores at or above this value are mate scores (the longest mate the search can see is `MAX_PLY` plies). Scores at or below its negation are mated-in scores.
+/// Threshold above which a score represents a forced mate.
 pub const MATE_IN_MAX: i32 = MATE - MAX_PLY as i32;
 
-/// Sentinel for "no static evaluation", stored when the side to move is in check. Just outside the score range.
+/// Sentinel for missing static eval (e.g. when in check).
 const NO_EVAL: i32 = 32_001;
-/// Capacity of the repetition-detection history: game positions plus the search path.
+/// Capacity of the per-thread repetition hash stack.
 const HIST_CAP: usize = 512;
-/// The saturation point of the history tables. Used in the gravity formula.
+/// Gravity saturation limit for history tables.
 const HISTORY_MAX: i32 = 16_384;
-/// Stack size for helper threads. Each searcher holds large fixed-size arrays on its stack, so the default thread stack is not enough.
+/// Stack size given to Lazy SMP helper threads.
 const THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-/// Ordering score of the transposition-table move: always first.
+/// Move-ordering score for the TT move.
 const TT_MOVE_SCORE: i32 = 1 << 30;
-/// Base ordering score of captures with non-negative SEE, and queen promotions.
+/// Base move-ordering score for SEE >= 0 captures and queen promotions.
 const GOOD_CAPTURE: i32 = 1 << 28;
-/// Base ordering score of killer moves.
+/// Base move-ordering score for killer moves.
 const KILLER_SCORE: i32 = 1 << 26;
-/// Ordering score of the counter move.
+/// Move-ordering score for the counter move.
 const COUNTER_SCORE: i32 = 1 << 25;
-/// Base ordering score of losing captures and under-promotions. Negative, so they sort after all quiet moves.
+/// Base move-ordering score for losing captures and under-promotions.
 const BAD_CAPTURE: i32 = -(1 << 24);
 
-/// Lazy SMP depth-skipping pattern, part 1: the block length for helper thread `i`.
+/// Lazy SMP helper depth-skip block sizes.
 const SKIP_SIZE: [i32; 20] = [1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4];
-/// Lazy SMP depth-skipping pattern, part 2: the phase offset for helper thread `i`. Together with [`SKIP_SIZE`] it makes different helpers skip different depths.
+/// Lazy SMP helper depth-skip phase offsets.
 const SKIP_PHASE: [i32; 20] = [0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7];
 
-/// Natural logarithm computed in `const` context, by range reduction to `[1, 2)`
-/// and an atanh series. Needed because floating-point `ln` is not `const`, and
-/// the reduction table is built at compile time.
+/// Const-eval natural log via range reduction + atanh series (used to build [`LMR_TABLE`] at compile time).
 const fn ln(x: f64) -> f64 {
     let mut m = x;
     let mut k = 0i32;
@@ -272,11 +168,7 @@ const fn ln(x: f64) -> f64 {
     k as f64 * core::f64::consts::LN_2 + 2.0 * sum
 }
 
-/// Builds the late-move-reduction table: `reduction = 0.75 + ln(depth) * ln(move_number) / 2.25`,
-/// truncated to an integer, for depth and move number below 64.
-///
-/// The formula is logarithmic in both arguments: late moves at high depth are
-/// reduced the most, early moves and shallow nodes barely at all.
+/// Build the compile-time LMR table (`0.75 + ln(depth) * ln(move_count) / 2.25`).
 const fn build_lmr() -> [[u8; 64]; 64] {
     let mut table = [[0u8; 64]; 64];
     let mut depth = 1;
@@ -292,15 +184,14 @@ const fn build_lmr() -> [[u8; 64]; 64] {
     table
 }
 
-/// The reduction table, indexed `[depth][move_number]`.
+/// Precomputed LMR reductions indexed `[depth][move_count]`.
 static LMR_TABLE: [[u8; 64]; 64] = build_lmr();
 
-/// Switches and tuning values for the search.
+/// Feature switches and pruning margins for the search.
 ///
-/// Every enhancement can be turned off (see [`Params::baseline`]) so its
-/// strength contribution can be measured by self-play. [`Params::default`] is the
-/// configuration the engine ships with. Through UCI, the fields are set with
-/// `setoption name <name> value <number>`; see [`Params::set`] for the names.
+/// [`Params::default`] is the shipping setup; [`Params::baseline`] turns every
+/// search enhancement off for A/B testing. Individual fields can be tweaked by
+/// name via [`Params::set`] (and UCI `setoption`).
 ///
 /// ```
 /// use wustite::search::Params;
@@ -315,72 +206,68 @@ static LMR_TABLE: [[u8; 64]; 64] = build_lmr();
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
-    /// Aspiration windows at the root from depth 5.
+    /// Enable root aspiration windows from depth 5.
     pub aspiration: bool,
-    /// Late move reductions.
+    /// Enable late move reductions.
     pub lmr: bool,
-    /// Null-move pruning.
+    /// Enable null-move pruning.
     pub nmp: bool,
-    /// Reverse futility pruning (also called static null-move pruning).
+    /// Enable reverse futility pruning.
     pub rfp: bool,
-    /// Razoring: verify hopeless nodes with a quiescence search at shallow depth.
+    /// Enable shallow razoring into quiescence search.
     pub razoring: bool,
-    /// Futility pruning of quiet moves.
+    /// Enable quiet-move futility pruning.
     pub futility: bool,
-    /// Late move pruning of quiet moves.
+    /// Enable late move pruning for quiet moves.
     pub lmp: bool,
-    /// Pruning of moves with a bad static exchange result.
+    /// Enable SEE pruning at shallow depths.
     pub see_pruning: bool,
-    /// Internal iterative reduction when there is no table move.
+    /// Enable internal iterative reduction when no TT move is found.
     pub iir: bool,
-    /// Capture history in move ordering and updates.
+    /// Enable capture history in move ordering.
     pub capture_history: bool,
-    /// Continuation history (one and two plies back) for quiet move ordering.
+    /// Enable 1- and 2-ply continuation history.
     pub cont_history: bool,
-    /// Singular extensions, double extensions, multi-cut and negative extensions.
+    /// Enable singular extensions (plus double ext, multi-cut, and negative ext).
     pub singular: bool,
-    /// ProbCut.
+    /// Enable ProbCut.
     pub probcut: bool,
-    /// Use a valid transposition-table score as the node's evaluation estimate.
+    /// Refine static eval using directionally valid TT scores.
     pub tt_eval: bool,
-    /// Adjust late-move reductions by the move's history score.
+    /// Scale LMR reductions by quiet move history.
     pub hist_lmr: bool,
-    /// Evaluate with the NNUE network (`true`) or the classical PeSTO evaluation (`false`).
+    /// Use NNUE evaluation (`false` falls back to classical PeSTO).
     pub nnue: bool,
-    /// Prune quiet moves with very negative history at low depth.
+    /// Prune quiet moves with strongly negative history at low depth.
     pub hist_pruning: bool,
-    /// History pruning threshold: prune when history is below `-margin * depth`.
+    /// History pruning threshold (`history < -margin * depth`).
     pub hist_prune_margin: i32,
-    /// Reverse futility margin per ply of remaining depth, in centipawns.
+    /// Reverse futility margin per ply (cp).
     pub rfp_margin: i32,
-    /// Razoring margin per ply of remaining depth, in centipawns.
+    /// Razoring margin per ply (cp).
     pub razor_margin: i32,
-    /// Constant part of the futility margin, in centipawns.
+    /// Base constant in the futility pruning margin (cp).
     pub futility_base: i32,
-    /// Per-ply part of the futility margin, in centipawns.
+    /// Per-ply slope in the futility pruning margin (cp).
     pub futility_slope: i32,
-    /// Base null-move reduction in plies. The depth- and eval-dependent parts are added to it.
+    /// Base ply reduction for null-move pruning.
     pub nmp_base: i32,
-    /// Null-move results at or beyond this depth are verified by a reduced real search.
+    /// Minimum depth at which null-move cutoffs run a verification search.
     pub nmp_verify_depth: i32,
-    /// SEE pruning margin for captures: skip when SEE is below `-margin * depth`.
+    /// SEE pruning margin per ply for captures (`-margin * depth`).
     pub see_capture_margin: i32,
-    /// SEE pruning margin for quiet moves: skip when SEE is below `-margin * depth`.
+    /// SEE pruning margin per ply for quiet moves (`-margin * depth`).
     pub see_quiet_margin: i32,
-    /// Initial half-width of the aspiration window, in centipawns.
+    /// Starting half-width for aspiration windows (cp).
     pub aspiration_delta: i32,
-    /// How far above beta ProbCut tests, in centipawns.
+    /// Centipawn offset above beta tested by ProbCut.
     pub probcut_margin: i32,
-    /// Minimum depth at which singular extensions are tried.
+    /// Minimum depth required to test singular extensions.
     pub singular_depth: i32,
 }
 
 impl Params {
-    /// The plain configuration: every pruning and reduction feature off, NNUE on.
-    ///
-    /// Useful as the reference when measuring what one feature gains. The numeric
-    /// margins hold their normal values, so enabling a single flag gives that feature
-    /// with its standard tuning.
+    /// Plain alpha-beta baseline: all pruning/reduction flags off, NNUE on, default margins intact.
     ///
     /// ```
     /// use wustite::search::Params;
@@ -423,10 +310,9 @@ impl Params {
         }
     }
 
-    /// Sets one parameter by name. Returns `false` if the name is not recognised.
+    /// Update a field by case-insensitive name (no spaces). Returns `false` if unknown.
     ///
-    /// Names are case-insensitive and contain no spaces. Boolean parameters take
-    /// `0` for off and any other value for on; numeric parameters store the value.
+    /// Booleans treat `0` as `false` and anything else as `true`.
     ///
     /// | Booleans | Numbers |
     /// | --- | --- |
@@ -488,28 +374,25 @@ impl Default for Params {
     }
 }
 
-/// What bounds a search: a depth, a node budget, and soft and hard time limits.
-///
-/// Build one from a UCI `go` command with [`crate::time::build_limits`], or use
-/// [`SearchLimits::depth_only`] for a plain depth-limited search.
+/// Depth, node, and clock limits controlling when [`think`] stops.
 #[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
-    /// Maximum iteration depth in plies.
+    /// Highest completed iteration depth.
     pub depth: i32,
-    /// Maximum nodes to search, or `0` for no limit.
+    /// Total nodes searched across all threads.
     pub nodes: u64,
-    /// Soft time limit: checked between iterations, after which no new iteration starts.
+    /// Soft deadline checked between iterations.
     pub soft: Option<Duration>,
-    /// Hard time limit: checked inside the search, after which the search aborts.
+    /// Hard deadline checked inside the search every 1024 nodes.
     pub hard: Option<Duration>,
-    /// Search until told to stop, ignoring the time limits.
+    /// Ignore time limits and keep going until `shared.stop` is raised.
     pub infinite: bool,
-    /// When the search started. All elapsed time is measured from here.
+    /// Timestamp when the search started.
     pub start: Instant,
 }
 
 impl SearchLimits {
-    /// Limits that only bound the depth, with no node or time limit.
+    /// Convenience limits with only a depth cap and no time/node limits.
     pub fn depth_only(depth: i32) -> SearchLimits {
         SearchLimits {
             depth,
@@ -522,24 +405,20 @@ impl SearchLimits {
     }
 }
 
-/// State shared between the UCI thread and every search thread, all atomics.
-///
-/// The UCI thread sets [`SharedState::stop`] to end a search and
-/// [`SharedState::pondering`] to run one on the opponent's time; searchers add to
-/// the node counter and read both flags.
+/// Atomic flags and node counter shared between the UCI loop and all search threads.
 pub struct SharedState {
-    /// Set to ask all searchers to finish as soon as possible.
+    /// Raised to abort all running search threads.
     pub stop: AtomicBool,
-    /// Total nodes searched by all threads, updated in batches of about 1024.
+    /// Combined node count flushed by searchers every 1024 nodes.
     pub nodes: AtomicU64,
-    /// While `true`, the search clock does not run and the search does not stop on its own.
+    /// While `true`, clock limits are paused until `ponderhit` clears it.
     pub pondering: AtomicBool,
-    /// Milliseconds already elapsed when `ponderhit` arrived. Subtracted from the elapsed time so only time after the hit counts.
+    /// Milliseconds already elapsed when `ponderhit` arrived.
     pub ponder_offset_ms: AtomicU64,
 }
 
 impl SharedState {
-    /// A fresh state: not stopped, no nodes, not pondering.
+    /// Create a clean `SharedState` (not stopped, 0 nodes, not pondering).
     pub fn new() -> SharedState {
         SharedState {
             stop: AtomicBool::new(false),
@@ -556,21 +435,10 @@ impl Default for SharedState {
     }
 }
 
-/// Entries in the continuation-history table: `12 * 64 * 12 * 64` (previous piece and square by current piece and square).
+/// Flattened continuation-history size (`12 * 64 * 12 * 64`).
 const CONT_SIZE: usize = 12 * 64 * 12 * 64;
 
-/// Per-thread move-ordering tables that persist between searches within a game.
-///
-/// * **Butterfly history** `[colour][from][to]`: how often a quiet move caused
-///   a cutoff.
-/// * **Counter moves** `[piece][to]`: the reply that refuted the opponent's last move.
-/// * **Capture history** `[piece][to][victim]`: the capture analogue.
-/// * **Continuation history**: quiet-move score conditioned on the move one or two
-///   plies earlier.
-///
-/// They are created with [`Heuristics::new`], which is boxed because the
-/// continuation table is large, and wiped with [`Heuristics::clear`] on a new
-/// game. Each search thread needs its own set.
+/// Per-thread move-ordering tables (butterfly, counter-move, capture, and continuation history) persisted across moves in a game.
 pub struct Heuristics {
     butterfly: [[[i16; 64]; 64]; 2],
     counter: [[Move; 64]; 12],
@@ -579,7 +447,7 @@ pub struct Heuristics {
 }
 
 impl Heuristics {
-    /// Allocates zeroed tables.
+    /// Allocate a zeroed `Heuristics` bundle on the heap.
     pub fn new() -> Box<Heuristics> {
         Box::new(Heuristics {
             butterfly: [[[0; 64]; 64]; 2],
@@ -589,7 +457,7 @@ impl Heuristics {
         })
     }
 
-    /// Zeroes all tables.
+    /// Zero every table (called on `ucinewgame`).
     pub fn clear(&mut self) {
         self.butterfly = [[[0; 64]; 64]; 2];
         self.counter = [[Move::NONE; 64]; 12];
@@ -598,24 +466,20 @@ impl Heuristics {
     }
 }
 
-/// Flattens a (previous piece, previous destination, piece, destination) tuple into an index into the continuation-history array.
+/// Flatten `(prev_piece, prev_to, piece, to)` into a continuation-history index.
 #[inline(always)]
 fn cont_index(prev_piece: usize, prev_to: usize, piece: usize, to: usize) -> usize {
     ((prev_piece * 64 + prev_to) * 12 + piece) * 64 + to
 }
 
-/// Applies a history bonus with *gravity*: `entry += bonus - entry * |bonus| / HISTORY_MAX`.
-///
-/// The correction term shrinks the update as the entry approaches
-/// [`HISTORY_MAX`], so values stay bounded without a hard clamp and old results
-/// decay as new information comes in.
+/// Apply a history bonus with gravity decay (`entry += bonus - entry * |bonus| / HISTORY_MAX`).
 #[inline(always)]
 fn gravity(entry: &mut i16, bonus: i32) {
     let current = *entry as i32;
     *entry = (current + bonus - current * bonus.abs() / HISTORY_MAX) as i16;
 }
 
-/// The `(piece, destination, victim)` index of a capture in the capture-history table, or `None` for non-captures.
+/// Extract `(attacker_piece, to_sq, victim_type)` for a capture, or `None` for quiet moves.
 fn capture_slot(pos: &Position, mv: Move) -> Option<(usize, usize, usize)> {
     if !mv.is_capture() {
         return None;
@@ -629,31 +493,24 @@ fn capture_slot(pos: &Position, mv: Move) -> Option<(usize, usize, usize)> {
     Some((piece, mv.to_sq().idx(), victim))
 }
 
-/// The outcome of a [`think`] call.
-///
-/// When the search was stopped before depth 1 completed, `best_move` is the first
-/// legal move so that a legal move is always available. With no legal moves
-/// (checkmate or stalemate) it is [`Move::NONE`](crate::Move::NONE).
+/// Best move, score, depth, node count, and PV returned by [`think`].
 #[derive(Clone, Debug, Default)]
 pub struct SearchResult {
-    /// The move to play.
+    /// Chosen root move (or [`Move::NONE`] if checkmated/stalemated).
     pub best_move: Move,
-    /// The expected reply, second in the principal variation, for UCI pondering. [`Move::NONE`](crate::Move::NONE) when unknown.
+    /// Second move of the PV for UCI pondering, or [`Move::NONE`].
     pub ponder_move: Move,
-    /// Score of the last completed iteration. Format it with [`format_score`].
+    /// Score from the last finished iteration (format with [`format_score`]).
     pub score: i32,
-    /// Depth of the last completed iteration.
+    /// Highest completed iteration depth.
     pub depth: i32,
-    /// Total nodes searched by all threads.
+    /// Total nodes searched across all threads.
     pub nodes: u64,
-    /// The principal variation: the line both sides are expected to play.
+    /// Principal variation from the root.
     pub pv: Vec<Move>,
 }
 
-/// Per-ply search state: the static evaluation (for the *improving* test), the
-/// two killer moves, the move that was made to reach the next ply (for
-/// continuation history and counter moves), the piece that moved, and the move
-/// excluded during a singular-extension verification search.
+/// Per-ply scratchpad (static eval, killers, last move/piece, and singular-excluded move).
 #[derive(Clone, Copy)]
 struct StackEntry {
     static_eval: i32,
@@ -663,7 +520,7 @@ struct StackEntry {
     excluded: Move,
 }
 
-/// A cleared [`StackEntry`].
+/// Default empty [`StackEntry`].
 const EMPTY_ENTRY: StackEntry = StackEntry {
     static_eval: NO_EVAL,
     killers: [Move::NONE; 2],
@@ -672,12 +529,7 @@ const EMPTY_ENTRY: StackEntry = StackEntry {
     excluded: Move::NONE,
 };
 
-/// Adjusts a mate score before it goes into the transposition table.
-///
-/// Mate scores are relative to the root (`MATE - ply`). Stored as is, the same
-/// position reached at a different ply would report a different mate distance.
-/// The table instead stores the distance from the *node*, by adding the current
-/// ply to winning mates and subtracting it from losing ones.
+/// Convert a root-relative mate score to node-relative distance before storing in the TT.
 #[inline(always)]
 fn score_to_tt(score: i32, ply: usize) -> i32 {
     if score >= MATE_IN_MAX {
@@ -689,7 +541,7 @@ fn score_to_tt(score: i32, ply: usize) -> i32 {
     }
 }
 
-/// The inverse of [`score_to_tt`]: re-bases a stored mate score onto the current ply.
+/// Inverse of [`score_to_tt`]: re-base a TT mate score onto the current `ply`.
 #[inline(always)]
 fn score_from_tt(score: i32, ply: usize) -> i32 {
     if score >= MATE_IN_MAX {
@@ -701,7 +553,7 @@ fn score_from_tt(score: i32, ply: usize) -> i32 {
     }
 }
 
-/// Whether a stored bound proves the node's result is outside or at the edge of the window: exact always, a lower bound when it reaches beta, an upper bound when it does not exceed alpha.
+/// Return `true` if a TT bound can trigger an immediate cutoff for `(alpha, beta)`.
 #[inline(always)]
 fn bound_allows(bound: Bound, score: i32, alpha: i32, beta: i32) -> bool {
     match bound {
@@ -712,9 +564,7 @@ fn bound_allows(bound: Bound, score: i32, alpha: i32, beta: i32) -> bool {
     }
 }
 
-/// Formats a score as UCI does: `cp <centipawns>` or `mate <moves>`, where the
-/// mate distance is in *moves* (not plies) and is negative when the side to move
-/// is being mated.
+/// Format a search score as UCI `cp <n>` or `mate <moves>` (negative if being mated).
 ///
 /// ```
 /// use wustite::search::{format_score, MATE};
@@ -734,10 +584,7 @@ pub fn format_score(score: i32) -> String {
     }
 }
 
-/// Ordering score for a capture or promotion: MVV-LVA (`victim * 16 - attacker`)
-/// plus a small capture-history term, offset into the good-capture or
-/// bad-capture range by SEE. Queen promotions rank above everything else in the
-/// good range; under-promotions are treated as bad.
+/// Score captures and promotions via MVV-LVA + capture history, split into good/bad bands by SEE.
 fn tactical_score(pos: &Position, mv: Move, history: i32) -> i32 {
     let victim = if mv.is_en_passant() {
         SEE_VALUE[PieceType::Pawn.idx()]
@@ -762,16 +609,7 @@ fn tactical_score(pos: &Position, mv: Move, history: i32) -> i32 {
     }
 }
 
-/// All state of one search thread.
-///
-/// A `Searcher` is created per thread for every call to [`think`], borrowing the
-/// shared table, the shared flags and its own [`Heuristics`]. Its large arrays
-/// (the ply stack, principal variation triangle, repetition history and NNUE
-/// accumulators) are why helper threads need a large stack.
-///
-/// The `pv` array is a *triangular* table: each ply's principal variation is
-/// built by prepending the move just played to its child's, so the root's
-/// variation is complete when the search returns.
+/// Per-thread search state holding the ply stack, triangular PV table, repetition hashes, and NNUE accumulators.
 struct Searcher<'a> {
     id: usize,
     tt: &'a TranspositionTable,
@@ -795,11 +633,7 @@ struct Searcher<'a> {
 }
 
 impl<'a> Searcher<'a> {
-    /// Creates a searcher for thread `id` (0 is the main thread).
-    ///
-    /// Copies the relevant tail of the game history for repetition detection,
-    /// appends the root hash if it is missing, and, when NNUE is enabled, loads the
-    /// active network and computes the root accumulator.
+    /// Set up a searcher for thread `id` (`0` = main thread), seeding repetition history and the root NNUE accumulator.
     #[allow(clippy::too_many_arguments)]
     fn new(
         id: usize,
@@ -848,12 +682,7 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Static evaluation of the node at `ply`.
-    ///
-    /// Bare-king endings use the mop-up rule from [`crate::eval`]. Otherwise the
-    /// network is applied to the accumulator for this ply, with the result clamped
-    /// inside the non-mate score range, or the classical evaluation is used if NNUE
-    /// is off. Debug builds assert that the accumulator equals a fresh recomputation.
+    /// Evaluate `pos` at `ply` (mop-up -> NNUE accumulator -> classical PeSTO). Debug builds cross-check the accumulator.
     #[inline(always)]
     fn evaluate(&self, pos: &Position, ply: usize) -> i32 {
         if let Some(score) = bare_king_eval(pos) {
@@ -878,13 +707,7 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Writes the accumulator of the child reached by `mv` into the next ply's slot.
-    ///
-    /// This must happen immediately before descending into the child. In particular,
-    /// singular-extension verification searches run at the **same** ply and write
-    /// their own child accumulators, so the real child's update must come after the
-    /// verification search, otherwise the child would search with a corrupt
-    /// accumulator.
+    /// Update `acc[ply + 1]` for `mv`. Must run right before descending (after any singular verification search at `ply`).
     #[inline(always)]
     fn update_accumulator(&mut self, pos: &Position, mv: Move, ply: usize) {
         if let Some(net) = &self.net {
@@ -893,14 +716,14 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Makes `mv` on a copy of `pos` and updates the NNUE accumulator for the child.
+    /// Update the child NNUE accumulator and return `pos.make_move(mv)`.
     #[inline(always)]
     fn make_move(&mut self, pos: &Position, mv: Move, ply: usize) -> Position {
         self.update_accumulator(pos, mv, ply);
         pos.make_move(mv)
     }
 
-    /// Makes a null move and copies the parent's accumulator, since no features change.
+    /// Copy the parent accumulator into `ply + 1` and return `pos.make_null_move()`.
     #[inline(always)]
     fn make_null_move(&mut self, pos: &Position, ply: usize) -> Position {
         if self.net.is_some() {
@@ -909,23 +732,20 @@ impl<'a> Searcher<'a> {
         pos.make_null_move()
     }
 
-    /// Adds the nodes counted since the last flush to the shared counter.
+    /// Push local un-flushed nodes to `shared.nodes`.
     fn flush_nodes(&mut self) {
         let delta = self.nodes - self.flushed;
         self.flushed = self.nodes;
         self.shared.nodes.fetch_add(delta, Ordering::Relaxed);
     }
 
-    /// Sets the shared stop flag and stops this searcher.
+    /// Mark this searcher stopped and raise the global `shared.stop` flag.
     fn trigger_stop(&mut self) {
         self.stopped = true;
         self.shared.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Called every 1024 nodes. Flushes the node count, and then checks whether to
-    /// stop: the shared stop flag for every thread, and the node and hard-time limits
-    /// for the main thread. Nothing stops before depth 2 is reached, so a move always
-    /// exists.
+    /// Periodic 1024-node check: flush nodes, read `shared.stop`, and enforce node/hard-time limits on thread 0.
     fn poll(&mut self) {
         let delta = self.nodes - self.flushed;
         self.flushed = self.nodes;
@@ -950,15 +770,7 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Whether `pos` is a draw: insufficient material, the fifty-move rule, or a
-    /// repetition.
-    ///
-    /// Only positions an even number of plies back, at least four, can repeat the
-    /// current one, and only back to the last irreversible move (the halfmove
-    /// clock). A repetition inside the search tree (within `ply` plies of the root)
-    /// counts at once, because the side can choose to repeat; one that reaches before
-    /// the root must have occurred twice already. At 100 halfmoves the position is
-    /// a draw unless the side to move is checkmated.
+    /// Check insufficient material, 50-move rule (excluding checkmate), and repetition (2-fold inside tree, 3-fold across root).
     fn is_draw(&self, pos: &Position, ply: usize) -> bool {
         if pos.insufficient_material() {
             return true;
@@ -986,20 +798,20 @@ impl<'a> Searcher<'a> {
         false
     }
 
-    /// Pushes a position hash onto the repetition history when descending.
+    /// Push a position hash onto the repetition stack.
     #[inline(always)]
     fn push_hash(&mut self, key: u64) {
         self.hist[self.hist_len] = key;
         self.hist_len += 1;
     }
 
-    /// Pops the hash pushed by [`Searcher::push_hash`] when returning.
+    /// Pop the latest hash from the repetition stack.
     #[inline(always)]
     fn pop_hash(&mut self) {
         self.hist_len -= 1;
     }
 
-    /// Builds the principal variation at `ply` as `mv` followed by the child's variation.
+    /// Prepend `mv` onto the child's PV line in the triangular table.
     fn update_pv(&mut self, ply: usize, mv: Move) {
         self.pv[ply][0] = mv;
         let child_len = self.pv_len[ply + 1];
@@ -1009,13 +821,13 @@ impl<'a> Searcher<'a> {
         self.pv_len[ply] = child_len + 1;
     }
 
-    /// Updates the butterfly history entry for a quiet move by `bonus` (negative for a penalty).
+    /// Apply a gravity-scaled butterfly history update.
     fn update_history(&mut self, color: Color, mv: Move, bonus: i32) {
         let entry = &mut self.heur.butterfly[color.idx()][mv.from_sq().idx()][mv.to_sq().idx()];
         gravity(entry, bonus);
     }
 
-    /// Updates the continuation-history entries pairing the current move with the moves one and two plies earlier.
+    /// Apply a gravity-scaled update to 1- and 2-ply continuation history.
     fn update_cont(&mut self, ply: usize, piece: usize, mv: Move, bonus: i32) {
         let to = mv.to_sq().idx();
         for back in [1usize, 2] {
@@ -1029,7 +841,7 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// The total history score of a quiet move: butterfly history plus, when enabled, continuation history one and two plies back.
+    /// Combined butterfly + (optional) continuation history score for a quiet move.
     fn quiet_history(&self, us: Color, piece: usize, mv: Move, ply: usize) -> i32 {
         let to = mv.to_sq().idx();
         let mut score = self.heur.butterfly[us.idx()][mv.from_sq().idx()][to] as i32;
@@ -1047,7 +859,7 @@ impl<'a> Searcher<'a> {
         score
     }
 
-    /// The capture-history score of a capture, or `0` when that feature is off.
+    /// Capture history lookup (returns `0` when disabled).
     fn capture_history(&self, pos: &Position, mv: Move) -> i32 {
         if !self.params.capture_history {
             return 0;
@@ -1058,14 +870,14 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Updates one capture-history entry by `bonus`.
+    /// Update one capture-history entry with gravity.
     fn reward_capture(&mut self, pos: &Position, mv: Move, bonus: i32) {
         if let Some((piece, to, victim)) = capture_slot(pos, mv) {
             gravity(&mut self.heur.capture[piece][to][victim], bonus);
         }
     }
 
-    /// Assigns an ordering score to every move in `list` according to the table in the [module documentation](crate::search).
+    /// Fill `scores` for every move in `list` (TT -> tactical -> killers -> counter -> quiet history).
     fn score_moves(
         &self,
         pos: &Position,
@@ -1100,44 +912,12 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// The main recursive alpha-beta search.
+    /// Core fail-soft PVS alpha-beta recursion (`PV = true` on principal-variation nodes).
     ///
-    /// `PV` marks nodes on the principal variation. `depth` is the remaining depth
-    /// in plies and `ply` the distance from the root. Returns the node's score, or 0
-    /// when the search has been stopped (the caller discards it).
-    ///
-    /// The order of operations at a node:
-    ///
-    /// 1. **Check extension**, then drop into [`Searcher::qsearch`] if depth is zero.
-    /// 2. **Bookkeeping**: node count, periodic [`Searcher::poll`], selective depth.
-    /// 3. **Draw detection**, the ply limit, and **mate-distance pruning** (not at
-    ///    the root).
-    /// 4. **Transposition-table probe**. A deep enough entry with a usable bound ends
-    ///    a non-PV node immediately.
-    /// 5. **Static evaluation** (not when in check), taken from the table when
-    ///    cached, and the *improving* flag: whether the evaluation is better than two
-    ///    plies ago, which makes pruning more or less aggressive.
-    /// 6. **TT-based evaluation refinement**, then **internal iterative reduction**.
-    /// 7. In non-PV nodes that are not in check: **razoring**, **reverse futility
-    ///    pruning**, **null-move pruning** (with verification) and **ProbCut**.
-    /// 8. **Generate and order** all legal moves. No moves means checkmate
-    ///    (`-MATE + ply`) or stalemate (0).
-    /// 9. For each move, best first:
-    ///    * **SEE pruning**, **late move pruning**, **futility pruning** and
-    ///      **history pruning**, only for non-root quiet or losing moves when no mate
-    ///      score is in the window;
-    ///    * **singular extension** of the table move;
-    ///    * make the move, then **PVS**: full window for the first move, then a
-    ///      zero-window search with a **late-move reduction** for later moves, a
-    ///      re-search at full depth if the reduced search beat alpha, and a full-window
-    ///      re-search if a PV node's score landed inside the window;
-    ///    * on a new best score update alpha and the principal variation, and on a
-    ///      beta cutoff reward the move in the history tables and killer slots and
-    ///      penalise the quiet moves tried before it.
-    /// 10. **Store** the result in the transposition table with a [`Bound`](crate::tt::Bound)
-    ///     (lower bound if it failed high, exact if it improved alpha, upper bound
-    ///     otherwise). Nothing is stored while a singular verification search is
-    ///     running, since its result excludes a move.
+    /// Applies check extensions, draw/mate-distance checks, TT probing, static eval
+    /// and improving detection, whole-node pruning (razoring, RFP, NMP, ProbCut),
+    /// move-loop pruning (SEE, LMP, futility, history), singular extensions, LMR,
+    /// and history updates on cutoffs.
     fn search<const PV: bool>(
         &mut self,
         pos: &Position,
@@ -1577,7 +1357,7 @@ impl<'a> Searcher<'a> {
         best
     }
 
-    /// On a beta cutoff, raises the capture-history entry of the winning capture and lowers those of the captures tried before it.
+    /// Boost capture history for `winner` and penalize earlier failed captures.
     fn reward_captures(&mut self, pos: &Position, depth: i32, winner: Move, tried: &[Move]) {
         let bonus = (155 * depth - 80).clamp(0, 2_000);
         if !winner.is_none() {
@@ -1590,11 +1370,7 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// On a beta cutoff by a quiet move: records it as the newest killer, raises its
-    /// butterfly and continuation history by a depth-scaled bonus
-    /// (`155 * depth - 80`, clamped to `0..=2000`), lowers the history of the quiet
-    /// moves tried earlier by the same amount, and records it as the counter move to
-    /// the opponent's previous move.
+    /// Update killers, counter move, butterfly history, and continuation history on a quiet beta cutoff.
     fn reward_quiet(&mut self, pos: &Position, ply: usize, mv: Move, depth: i32, tried: &[Move]) {
         let us = pos.side_to_move();
         if self.stack[ply].killers[0] != mv {
@@ -1620,15 +1396,7 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// Quiescence search: resolves captures at the leaves so the static evaluation
-    /// is only trusted in quiet positions.
-    ///
-    /// Without it the search would stop in the middle of an exchange and mistake a
-    /// queen-for-pawn trade for a free pawn. Not in check, the static evaluation is a
-    /// *stand-pat* lower bound (the side to move may decline every capture), and only
-    /// captures and promotions are generated, skipping those with a negative ordering
-    /// score (losing SEE) unless it is the table move. In check, every evasion is
-    /// generated and there is no stand-pat; no legal moves is checkmate.
+    /// Quiescence search at depth 0: stand-pat + SEE-good captures/promotions, or full evasions when in check.
     fn qsearch<const PV: bool>(
         &mut self,
         pos: &Position,
@@ -1761,10 +1529,7 @@ impl<'a> Searcher<'a> {
         best
     }
 
-    /// Lazy SMP helper staggering. The main thread never skips. Helper `i` skips
-    /// depth `d` when `((d + SKIP_PHASE[i]) / SKIP_SIZE[i]) % 2 == 1`, so that
-    /// different helpers work on different depths and fill the shared table with
-    /// complementary information.
+    /// Decide whether Lazy SMP helper thread `self.id` skips `depth` to diversify work.
     fn skips_depth(&self, depth: i32) -> bool {
         if self.id == 0 {
             return false;
@@ -1773,7 +1538,7 @@ impl<'a> Searcher<'a> {
         ((depth + SKIP_PHASE[i]) / SKIP_SIZE[i]) % 2 != 0
     }
 
-    /// Elapsed search time for limit checks: zero while pondering, and otherwise measured from the start minus any time already spent when `ponderhit` arrived.
+    /// Elapsed search time counting toward clock limits (zero while pondering, offset after `ponderhit`).
     fn limit_clock(&self) -> Duration {
         if self.shared.pondering.load(Ordering::Relaxed) {
             return Duration::ZERO;
@@ -1782,8 +1547,7 @@ impl<'a> Searcher<'a> {
         self.limits.start.elapsed().saturating_sub(offset)
     }
 
-    /// Prints a UCI `info` line: depth, selective depth, score, nodes, nodes per
-    /// second, hash fullness, time and the principal variation.
+    /// Print a standard UCI `info` line for a completed iteration.
     fn report(&self, depth: i32, score: i32) {
         let millis = self.limits.start.elapsed().as_millis().max(1) as u64;
         let nodes = self.shared.nodes.load(Ordering::Relaxed) + (self.nodes - self.flushed);
@@ -1801,13 +1565,7 @@ impl<'a> Searcher<'a> {
         println!("{line}");
     }
 
-    /// Iterative deepening driver for one thread. See the
-    /// [module documentation](crate::search) for the aspiration-window loop.
-    ///
-    /// After each completed iteration it records the best move, ponder move, score
-    /// and principal variation. On the main thread it then decides whether to stop:
-    /// the soft time limit has passed, a forced mate within the searched depth has
-    /// been found, or there is only one legal move.
+    /// Iterative deepening + aspiration-window loop for one thread.
     fn iterate(&mut self, root: &Position, report: bool) -> SearchResult {
         let mut result = SearchResult::default();
         let root_moves = legal_moves(root);
@@ -1895,22 +1653,11 @@ impl<'a> Searcher<'a> {
     }
 }
 
-/// Runs a complete search from `root` and returns the result.
+/// Run a full search from `root`, blocking until completion.
 ///
-/// * `game_hist` holds the hashes of every position of the game so far,
-///   oldest first, for repetition detection. Pass `&[root.hash()]` for a
-///   position with no history.
-/// * `limits` bounds the search, `shared` carries the stop flag, ponder state and
-///   node counter, and `tt` is the shared transposition table.
-/// * `heuristics` supplies one [`Heuristics`] per thread, and its length **is the
-///   thread count**: element 0 is the main thread and the rest are Lazy SMP
-///   helpers. An empty slice returns a default result.
-/// * `report` selects whether the main thread prints UCI `info` lines.
-///
-/// The call blocks until the search ends and uses scoped threads, so helpers are
-/// always joined before it returns. When `limits.infinite` is set or pondering
-/// is active, the call keeps waiting after the main thread finishes until
-/// `shared.stop` is set, as the UCI protocol requires.
+/// Spawns one scoped Lazy SMP helper per extra entry in `heuristics`
+/// (`heuristics[0]` is the main thread). In `infinite` or `ponder` mode, waits
+/// after reaching max depth until `shared.stop` is raised.
 #[allow(clippy::too_many_arguments)]
 pub fn think(
     root: &Position,
@@ -1953,9 +1700,7 @@ pub fn think(
     result
 }
 
-/// Searches `pos` to a fixed `depth` with a fresh `hash_mb` MiB table, one thread,
-/// the default [`Params`] and no output. A convenience for tests, examples and
-/// tools; the UCI layer uses [`think`] directly.
+/// Single-threaded fixed-depth search helper with a fresh `hash_mb` MiB TT and default [`Params`].
 ///
 /// ```
 /// use wustite::Position;
