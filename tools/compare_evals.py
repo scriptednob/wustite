@@ -6,7 +6,7 @@ Pearson correlation and mean absolute centipawn error against the datagen
 scores.
 
 Usage:
-    python3 <script.py> <wustite_bin> <net_a.nnue> <net_b.nnue> <data.txt> <n>
+    python3 tools/compare_evals.py <wustite_bin> <net_a.nnue> <net_b.nnue> <data.txt> <n>
 """
 
 import statistics

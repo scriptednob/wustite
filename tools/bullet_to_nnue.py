@@ -5,7 +5,7 @@ Bullet's binary (ignoring any trailing padding), prepends the 16-byte `WNNU`
 v1 header, and widens the output bias from `i16` to `i32`.
 
 Usage:
-    python3 <script.py> <quantised.bin> <output.nnue>
+    python3 tools/bullet_to_nnue.py <quantised.bin> <output.nnue>
 """
 
 import struct

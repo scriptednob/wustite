@@ -6,7 +6,7 @@ from White's perspective (`0.0`, `0.5`, or `1.0`), so this flips the score and
 result whenever Black is to move and skips any malformed lines.
 
 Usage:
-    python3 <script.py> <input.txt> <output.txt>
+    python3 tools/to_bullet.py <input.txt> <output.txt>
 """
 
 import sys
