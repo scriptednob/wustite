@@ -45,7 +45,9 @@
 //!
 //! Option names are case-insensitive. Every search flag and margin in [`Params`]
 //! can also be set via `setoption` with an integer (`0` = off, non-zero = on),
-//! e.g. `setoption name NMP value 0`, even though they aren't listed in `uci`.
+//! e.g. `setoption name NMP value 0`. Normal builds don't list them in `uci`.
+//! Builds with the `tune` Cargo feature do, because match runners such as
+//! fastchess only send options that the engine lists.
 //!
 //! # Example session
 //!
@@ -231,6 +233,11 @@ impl Engine {
         );
         println!("option name EvalFile type string default <internal>");
         println!("option name Clear Hash type button");
+        if cfg!(feature = "tune") {
+            for line in tune_options(&self.params) {
+                println!("{line}");
+            }
+        }
         println!("uciok");
     }
 
@@ -440,4 +447,66 @@ pub fn run() {
         engine.shared.pondering.store(false, Ordering::Relaxed);
     }
     engine.join_worker();
+}
+
+fn tune_options(p: &Params) -> Vec<String> {
+    let flags = [
+        ("aspiration", p.aspiration),
+        ("lmr", p.lmr),
+        ("nmp", p.nmp),
+        ("rfp", p.rfp),
+        ("razoring", p.razoring),
+        ("futility", p.futility),
+        ("lmp", p.lmp),
+        ("seepruning", p.see_pruning),
+        ("iir", p.iir),
+        ("capturehistory", p.capture_history),
+        ("conthistory", p.cont_history),
+        ("singular", p.singular),
+        ("probcut", p.probcut),
+        ("tteval", p.tt_eval),
+        ("histlmr", p.hist_lmr),
+        ("histpruning", p.hist_pruning),
+    ];
+    let numbers = [
+        ("histprunemargin", p.hist_prune_margin),
+        ("rfpmargin", p.rfp_margin),
+        ("razormargin", p.razor_margin),
+        ("futilitybase", p.futility_base),
+        ("futilityslope", p.futility_slope),
+        ("nmpbase", p.nmp_base),
+        ("nmpverifydepth", p.nmp_verify_depth),
+        ("seecapturemargin", p.see_capture_margin),
+        ("seequietmargin", p.see_quiet_margin),
+        ("aspirationdelta", p.aspiration_delta),
+        ("probcutmargin", p.probcut_margin),
+        ("singulardepth", p.singular_depth),
+    ];
+    let spin = |name: &str, value: i32, max: i32| {
+        format!("option name {name} type spin default {value} min 0 max {max}")
+    };
+    flags
+        .iter()
+        .map(|&(name, on)| spin(name, i32::from(on), 1))
+        .chain(
+            numbers
+                .iter()
+                .map(|&(name, value)| spin(name, value, 100_000)),
+        )
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_tune_option_is_accepted() {
+        let lines = tune_options(&Params::default());
+        assert_eq!(lines.len(), 28);
+        for line in lines {
+            let name = line.split_whitespace().nth(2).unwrap();
+            assert!(Params::default().set(name, 1), "{name}");
+        }
+    }
 }

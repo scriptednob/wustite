@@ -131,7 +131,17 @@ cargo run --release --example datagen -- --out data.txt --threads 4 --positions 
 
 `--net FILE` labels positions with an existing network instead of PeSTO. The built-in network is trained from this data with Bullet. The repo also includes a pure-Rust trainer in `examples/train.rs` and a magic multiplier finder in `examples/find_magics.rs`.
 
-Match testing and opening generation live in `tools/`. They need Python 3 and [python-chess](https://github.com/niklasf/python-chess):
+Strength tests run through `tools/sprt.py`, which needs Python 3 and [fastchess](https://github.com/Disservin/fastchess/releases). Put the fastchess executable in `testing/` or on your `PATH`. The script downloads the [`UHO_Lichess_4852_v1`](https://github.com/official-stockfish/books) opening book on its first run.
+
+```sh
+python tools/sprt.py
+python tools/sprt.py --base v0.4.2
+python tools/sprt.py --new-options histlmr=1 --elo1 5
+```
+
+The first command tests your working tree against the last commit. The second tests it against a tag, branch or commit. The third turns on a search option for the new side only. When the base is the same code, it tests that option on its own.
+
+The older Python match runner and opening generator also live in `tools/`. They need [python-chess](https://github.com/niklasf/python-chess):
 
 ```sh
 python3 tools/make_openings.py target/release/wustite tools/openings.txt 200

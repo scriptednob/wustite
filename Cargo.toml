@@ -11,6 +11,9 @@ keywords = ["chess", "uci", "chess-engine", "bitboard", "alpha-beta"]
 categories = ["games", "command-line-utilities"]
 exclude = [".github", "tools", "target"]
 
+[features]
+tune = []
+
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
 rustdoc-args = ["--generate-link-to-definition"]
